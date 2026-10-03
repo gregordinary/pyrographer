@@ -1,0 +1,11 @@
+# WebUSB lives behind web-sys's `web_sys_unstable_apis` cfg, and there is no
+# other way to reach `navigator.usb` from Rust. The gate is web-sys's policy for
+# any specification that is not yet a W3C Recommendation; it is not a statement
+# about the browser, where Chromium has shipped WebUSB since 2017 and the
+# in-browser Rockchip and Ingenic flashers rest on it.
+#
+# It is set for the wasm32 target and for nothing else, so a native build never
+# sees it. Core's wasm clippy gate compiles with it, which is what keeps the
+# WebUSB transport from bit-rotting behind a cfg nobody turns on.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

@@ -1,0 +1,76 @@
+[package]
+name = "pyrographer-core"
+description = "The library behind pyrographer, a flashing and recovery toolkit for embedded devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The scripted transport and the conversations that drive it, which core's own
+# tests use and which another crate's tests can borrow. The GUI's job lifecycle
+# is the reason it is a feature rather than `cfg(test)`: a job that runs to
+# completion, one that is canceled mid-window, and an agent that falls out of
+# step are all things to pin without a board, and they are pinned in a different
+# crate from the one the mock lives in. It is off in every shipped build -- the
+# GUI names it in dev-dependencies alone, so the binary never carries it.
+testing = []
+
+# nusb speaks to the operating system's USB stack, which a wasm32 build does not
+# have: in the browser the transport is WebUSB, and it is a different
+# implementation of the same seam. Depending on nusb unconditionally would break
+# the wasm build before a line of it was written.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nusb.workspace = true
+# The native serial transport for StarFive UART recovery. Like nusb, it speaks to
+# the operating system directly, which a wasm32 build has no way to do: the
+# browser's serial seam is Web Serial. See the workspace manifest for why serial2.
+serial2.workspace = true
+
+# The other side of both seams. WebUSB is the browser's USB stack and Web Serial
+# is its serial one, and these are the bindings to them -- the same three crates
+# the workspace sanctions for the web build, plus js-sys, which ships with
+# wasm-bindgen and which the transports reach for directly: `Promise::race` is
+# what gives a transfer a deadline neither browser API will give it, and
+# `Uint8Array` is what a USB data phase and a serial chunk both arrive in.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = [
+    "Navigator",
+    "Usb",
+    "UsbAlternateInterface",
+    "UsbConfiguration",
+    "UsbControlTransferParameters",
+    "UsbDevice",
+    "UsbDeviceFilter",
+    "UsbDeviceRequestOptions",
+    "UsbDirection",
+    "UsbEndpoint",
+    "UsbEndpointType",
+    "UsbInTransferResult",
+    "UsbInterface",
+    "UsbOutTransferResult",
+    "UsbRecipient",
+    "UsbRequestType",
+    "UsbTransferStatus",
+    "Window",
+    # Web Serial, the browser's implementation of the second transport seam. A
+    # port carries its bytes on a pair of streams rather than on endpoints, so the
+    # stream reader and writer come with it; every one of these is behind the same
+    # `--cfg=web_sys_unstable_apis` WebUSB is.
+    "FlowControlType",
+    "ParityType",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
+    "Serial",
+    "SerialOptions",
+    "SerialPort",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+] }
+
+[dev-dependencies]
+pollster.workspace = true

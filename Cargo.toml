@@ -1,0 +1,69 @@
+# pyrographer workspace.
+#
+# Everyday `cargo build` and `cargo test` operate on the default members
+# (core and CLI) so they stay fast and pull no GUI dependencies. Build the
+# GUI explicitly with `cargo build -p pyrographer-gui`.
+
+[workspace]
+# Resolver 3 is MSRV-aware: it holds a dependency back to the newest release that
+# still builds on `rust-version` below, rather than resolving to one that outruns
+# the floor and turns the declared MSRV into a claim nothing checks.
+resolver = "3"
+members = [
+    "crates/pyrographer-core",
+    "crates/pyrographer",
+    "crates/pyrographer-gui",
+]
+default-members = [
+    "crates/pyrographer-core",
+    "crates/pyrographer",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+pyrographer-core = { path = "crates/pyrographer-core" }
+
+# 0.2.5 fixed a leak in every macOS control-IN transfer, and every DFU status
+# poll is one.
+nusb = "0.2.5"
+
+# The native serial transport, for StarFive's UART recovery. Setting a baud rate
+# on any OS is termios/ioctl or the Win32 equivalent -- irreducible platform FFI,
+# the same standing as nusb for USB. serial2 confines that unsafe to itself
+# (libc on Unix, windows-sys on Windows), compiles no C, and cross-compiles, so
+# `forbid(unsafe_code)` holds in our crates. Native only: a browser reaches a
+# serial line through Web Serial, a different implementation of the same seam.
+#
+# 0.2.37 is the release that moved to windows-sys. It also carries the 0.2.32 fix
+# to reading the baud rate back on Linux, which glibc 2.42 broke. An open reads
+# it back to check its own settings, so before that fix an open could fail.
+serial2 = "0.2.37"
+
+pico-args = "0.5"
+eframe = "0.36"
+pollster = "1.0"
+
+# Native file dialogs, and a picked `Blob` on the web. `file-handle-inner` is
+# what exposes the `web_sys::File` behind a picked handle -- and a `File` is a
+# `Blob`, so it slices, so the web flasher streams instead of buffering an image
+# it cannot hold. `gtk3` stays off: it would pull `gtk-sys` and real C linkage,
+# where the default backend only dlopens libdbus at runtime.
+rfd = { version = "0.17", features = ["file-handle-inner"] }
+
+# The web build. `js-sys` is not a fourth dependency in any meaningful sense --
+# it ships with wasm-bindgen and web-sys is built on it -- but the WebUSB
+# transport reaches for `Promise` and `Uint8Array` directly, so it is named.
+#
+# web-sys, js-sys and wasm-bindgen-futures each name their wasm-bindgen release
+# exactly, so the four share one floor. It is web-sys 0.3.105, the first whose
+# WebUSB `transfer_out` and `control_transfer_out` take `&[u8]`. The transport
+# passes a shared slice, and against an older web-sys it does not compile.
+wasm-bindgen = "0.2.128"
+wasm-bindgen-futures = "0.4.78"
+web-sys = "0.3.105"
+js-sys = "0.3.105"

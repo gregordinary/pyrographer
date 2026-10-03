@@ -1,0 +1,69 @@
+[package]
+name = "pyrographer-gui"
+description = "Desktop application and web flasher for pyrographer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The crate is a library with a thin binary on top, because the web build is not
+# a binary at all: wasm-bindgen links against a cdylib and the browser calls the
+# entry point. The rlib is what the native binary and the tests use.
+[lib]
+name = "pyrographer_gui"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pyrographer-gui"
+path = "src/main.rs"
+
+[dependencies]
+pyrographer-core.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+
+# A job is a thread running `block_on`; see `platform`. The browser has neither
+# threads nor any need of them, and drives its jobs on its own event loop.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true
+
+# The web build. `rfd` picks the image -- `file-handle-inner` is what hands back
+# the `web_sys::File` behind it, and a `File` is a `Blob`, so it slices, so the
+# image streams. It has no *save* dialog on the web, so the dump goes out through
+# the File System Access API below, which is the only thing in a browser that will
+# give a page a file it can stream to rather than a download it must first
+# assemble in memory.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = [
+    "Blob",
+    "Document",
+    "File",
+    "FileSystemFileHandle",
+    "FileSystemHandle",
+    "FileSystemWritableFileStream",
+    "HtmlCanvasElement",
+    "SaveFilePickerOptions",
+    # The serial acquisition seam. A port arrives as a `SerialPort` from the
+    # chooser core's `request_port` opens, and `SerialPortInfo` is the only thing
+    # it will say about itself -- the adapter's USB IDs, which is what names it on
+    # screen where there is no path to show.
+    "SerialPort",
+    "SerialPortInfo",
+    "Usb",
+    "UsbDevice",
+    "Window",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+] }
+
+[dev-dependencies]
+# The scripted transport, and the conversations that drive it. This is what lets
+# the state module's tests run a job to completion, cancel one mid-window, and
+# desynchronize an agent with neither a board nor a window in sight. It is a
+# dev-dependency, so no shipped build carries it.
+pyrographer-core = { workspace = true, features = ["testing"] }
+pollster.workspace = true

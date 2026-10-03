@@ -1,0 +1,18 @@
+[package]
+name = "pyrographer"
+description = "Command-line tool for flashing and recovering embedded devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pyrographer"
+path = "src/main.rs"
+
+[dependencies]
+pyrographer-core.workspace = true
+pico-args.workspace = true
+# Drives the async verbs on the calling thread. The CLI wants no runtime beyond
+# a `block_on`, and pollster is exactly that.
+pollster.workspace = true

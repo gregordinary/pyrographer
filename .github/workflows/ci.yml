@@ -1,0 +1,156 @@
+# Every quality gate, on every push and pull request. A run on main that passes
+# them all publishes the book to GitHub Pages.
+#
+# The GUI crate sits outside the workspace's default-members, so neither a bare
+# `cargo clippy` nor a bare `cargo test` sees it. Both are named explicitly
+# below, or it bit-rots invisibly.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: Quality gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # eframe reaches the system's X11, Wayland, and GL libraries. Core and the
+      # CLI need none of this; the GUI clippy step does.
+      - name: Install the GUI's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxi-dev libxkbcommon-dev libxrandr-dev
+
+      - name: Install the toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache the build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (core and CLI)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (GUI)
+        run: cargo clippy -p pyrographer-gui --all-targets -- -D warnings
+
+      # The design says core compiles to wasm32, where nusb does not exist and
+      # the bus cannot be scanned. This is what keeps that claim honest. The lib
+      # only: the test harness does not build for this target, and the tests
+      # exercise the portable code on the host anyway.
+      #
+      # `.cargo/config.toml` sets `--cfg=web_sys_unstable_apis` for this target,
+      # which is how web-sys gates every WebUSB binding and the only way to reach
+      # `navigator.usb` from Rust. So this step compiles the WebUSB transport,
+      # rather than skipping over it behind a cfg nobody turns on.
+      - name: Clippy (core on wasm32)
+        run: cargo clippy --target wasm32-unknown-unknown -p pyrographer-core -- -D warnings
+
+      # And the web flasher itself. The GUI is one crate for a window and a tab,
+      # and this is what stops the tab half from quietly bit-rotting: the WebUSB
+      # transport, the `Blob` behind the image seam, and the `requestDevice`
+      # acquisition are compiled here or nowhere. The lib only -- a tab has no
+      # binary, and the crate's `main` exists solely so a wasm32 build of it has
+      # one to compile.
+      - name: Clippy (GUI on wasm32)
+        run: cargo clippy --target wasm32-unknown-unknown -p pyrographer-gui --lib -- -D warnings
+
+      # The codecs are sans-I/O and the backends run against a scripted
+      # transport, so the whole suite passes with no hardware attached.
+      - name: Test
+        run: cargo test
+
+      # Named explicitly for the same reason the clippy step above is: the GUI is
+      # outside default-members, so a bare `cargo test` never runs its tests. Its
+      # `state` drives real jobs against core's scripted transport, and its `ui`
+      # is drawn headless -- egui lays out real text with no window behind it -- so
+      # this needs no display and no hardware.
+      - name: Test (GUI)
+        run: cargo test -p pyrographer-gui
+
+      # -D warnings makes a broken intra-doc link fail the build, alongside the
+      # deny(missing_docs) core already sets.
+      - name: Docs
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # Named explicitly for the same reason the clippy and test steps are: the GUI
+      # is outside default-members, so the bare `cargo doc` above never documents
+      # it. Without this its intra-doc links and deny(missing_docs) go ungated, and
+      # a broken one rots unseen.
+      - name: Docs (GUI)
+        run: cargo doc --no-deps -p pyrographer-gui
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # Pinned, because `~/.cargo/bin` is cached: an unpinned install keeps
+      # whichever mdbook first landed there, and that is not a version anybody
+      # chose. With the pin, a cached copy of the same release makes this a no-op.
+      - name: Book
+        run: |
+          cargo install mdbook --locked --version 0.5.4
+          mdbook build docs
+
+      # The book this job just built is the book that gets published, so a page
+      # cannot go out from a commit that failed a gate. A pull request builds it
+      # and stops here.
+      - name: Package the book for Pages
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/book
+
+  pages:
+    name: Publish the book
+    needs: gates
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    # The token may deploy to Pages and prove where it came from, and nothing else.
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    # One deployment at a time, and a running one finishes rather than being
+    # cut off halfway by the next push.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

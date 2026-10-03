@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<!--
+  The web flasher's page.
+
+  Everything on it is the canvas: eframe draws the whole application into it, and
+  the same code draws the desktop window. What is here is the little that a tab
+  needs and a window does not.
+
+  Built with Trunk (`trunk serve --open` from this directory), which is a build
+  tool rather than a runtime dependency -- the same standing mdbook has.
+
+  WebUSB needs a secure context, so this is served over HTTPS or from localhost,
+  and it is Chromium-only. GitHub Pages hosts the documentation; the flasher is
+  self-hosted.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>pyrographer</title>
+
+    <!--
+      data-target-name selects the crate's cdylib (the `pyrographer_gui` lib
+      artifact, underscored), whose wasm carries the #[wasm_bindgen] `start` entry
+      point the module below imports. The crate also has a native binary target
+      (src/main.rs, `pyrographer-gui`), so without this Trunk cannot tell which of
+      the two artifacts to build for the web -- and the binary's wasm `main` is
+      empty and exports no `start`, so its bundle could not start the page.
+    -->
+    <link data-trunk rel="rust" data-target-name="pyrographer_gui" data-wasm-opt="2" />
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b0c0e;
+      }
+
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+
+      /* Shown until the wasm has loaded, and replaced by the canvas when it has. */
+      #loading {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #8b8f96;
+        font: 15px/1.5 system-ui, sans-serif;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="loading">Loading pyrographer...</div>
+    <canvas id="pyrographer"></canvas>
+
+    <script type="module">
+      // Trunk builds the wasm, runs its init(), and then fires this event with the
+      // module's exports on `window.wasmBindings` -- so the canvas is started here
+      // without importing a filename Trunk content-hashes for cache-busting, and
+      // without a second init() of our own. `start` is the #[wasm_bindgen] entry in
+      // lib.rs; eframe draws the whole application into the canvas it is given.
+      window.addEventListener("TrunkApplicationStarted", async () => {
+        const loading = document.getElementById("loading");
+
+        // A rejected start() must not leave "Loading pyrographer..." on the screen
+        // forever with no word of what went wrong -- an unsupported browser (WebUSB
+        // is Chromium-only) is the common case, and it should say so.
+        try {
+          await window.wasmBindings.start("pyrographer");
+          loading?.remove();
+        } catch (error) {
+          if (loading) {
+            loading.textContent =
+              "pyrographer could not start in this browser. The web flasher needs WebUSB, " +
+              "which today is Chromium-only and requires a secure context (HTTPS or localhost). " +
+              "Details: " + (error && error.message ? error.message : error);
+          }
+          throw error;
+        }
+      });
+    </script>
+  </body>
+</html>

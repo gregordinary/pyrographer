@@ -1,0 +1,235 @@
+# blockbench, 2026-09-02-151034
+
+host:   Linux 7.1.5-76070105-generic
+target: /dev/loop0 backed by /tmp/pyrographer-blockbench.img (256M)
+rustc:  rustc 1.98.0 (88d9e12ae 2026-08-18)
+
+############ pass 1: the inventory, unprivileged ############
+== 1. inventory (unprivileged) ==
+  device                  bytes   lblk   pblk bus      rm    ro    mounts
+  dm-0            1990716382720    512    512 virtual  false false -
+               refused: `dm-0` carries the running system. Writing it destroys the machine this is running on, and the damage is not reported at the time -- there is no override for this
+  dm-1            1990713147392    512    512 virtual  false false /
+               refused: `dm-1` carries the running system. Writing it destroys the machine this is running on, and the damage is not reported at the time -- there is no override for this
+  dm-2               4294442496    512    512 virtual  false false -
+               refused: `dm-2` carries the running system. Writing it destroys the machine this is running on, and the damage is not reported at the time -- there is no override for this
+  loop0               268435456    512    512 virtual  false false -
+  loop1                       0    512    512 virtual  false false -
+  loop2                       0    512    512 virtual  false false -
+  loop3                       0    512    512 virtual  false false -
+  loop4                       0    512    512 virtual  false false -
+  loop5                       0    512    512 virtual  false false -
+  loop6                       0    512    512 virtual  false false -
+  loop7                       0    512    512 virtual  false false -
+  nvme0n1         2000398934016    512    512 nvme     false false /boot/efi,/recovery
+               refused: `nvme0n1` carries the running system. Writing it destroys the machine this is running on, and the damage is not reported at the time -- there is no override for this
+  zram0             17179869184   4096   4096 virtual  false false -
+
+== 2. target ==
+  name         loop0
+  node         /dev/loop0
+  capacity     268435456 bytes (256.0 MiB)
+  geometry     512 logical / 512 physical
+  bus          virtual
+  model        -
+  removable    false
+  read-only    false
+  mounts       -
+  backing file /tmp/pyrographer-blockbench.img
+  [ok] the target is named twice and is not the running system's: loop0 (268435456 bytes)
+
+== 3. open ==
+  [FAIL] block::open takes the device O_EXCL|O_DIRECT: I/O error: `loop0` cannot be opened without privilege. Reading a device's geometry needs none, which is why a plan could be made, but opening it needs root or membership of the `disk` group
+
+stopped: cannot open `loop0`: I/O error: `loop0` cannot be opened without privilege. Reading a device's geometry needs none, which is why a plan could be made, but opening it needs root or membership of the `disk` group
+  [FAIL] the pass ran to the end: cannot open `loop0`: I/O error: `loop0` cannot be opened without privilege. Reading a device's geometry needs none, which is why a plan could be made, but opening it needs root or membership of the `disk` group
+
+== summary ==
+ok    the target is named twice and is not the running system's: loop0 (268435456 bytes)
+FAIL  block::open takes the device O_EXCL|O_DIRECT: I/O error: `loop0` cannot be opened without privilege. Reading a device's geometry needs none, which is why a plan could be made, but opening it needs root or membership of the `disk` group
+FAIL  the pass ran to the end: cannot open `loop0`: I/O error: `loop0` cannot be opened without privilege. Reading a device's geometry needs none, which is why a plan could be made, but opening it needs root or membership of the `disk` group
+
+3 checks, 2 failed
+
+############ pass 2: a GPT, read back through the backend ############
+
+== 2. target ==
+  name         loop0
+  node         /dev/loop0
+  capacity     268435456 bytes (256.0 MiB)
+  geometry     512 logical / 512 physical
+  bus          virtual
+  model        -
+  removable    false
+  read-only    false
+  mounts       -
+  backing file /tmp/pyrographer-blockbench.img
+  [ok] the target is named twice and is not the running system's: loop0 (268435456 bytes)
+
+== 3. open ==
+  [ok] block::open takes the device O_EXCL|O_DIRECT: opened `loop0`
+  [ok] a second exclusive open is refused while the first is held: invalid request: `loop0` is in use: the kernel refused an exclusive open. Something holds it -- a mounted filesystem, a volume stacked on it, or swap. Unmount or deactivate it first, though nothing is mounted on it, so look for a stacked device or swap
+
+== 4. read ==
+  info         268435456 bytes, 512-byte sectors, chip_id None, medium None
+  [ok] the agent's geometry agrees with sysfs: 268435456 bytes / 512 bytes
+  caps         Caps { can_erase: false, has_partitions: true, medium: None, can_verify: true, can_address_raw_lba: true }
+  read-back    Every window is read back off the flash before the next one goes out, so a difference stops the write where it stands.
+  sector 0     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  [ok] a raw read at the target sector answers: 16 bytes shown above
+  table        Gpt, 3 partitions
+               esp                  lba         2048 sectors        40960
+               boot                 lba        43008 sectors        81920
+               rootfs               lba       124928 sectors       204800
+  [ok] verbs::partitions reads a table over the block device: Gpt, 3 partitions
+  dump: 4194304 bytes
+  dump: 1048576/4194304
+  dump: 2097152/4194304
+  dump: 3145728/4194304
+  dump: 4194304/4194304
+  dump: done, 4194304 bytes
+  dumped       4194304 bytes to /tmp/pyrographer-blockbench/loop0-dump.bin in 0.01s (669.0 MiB/s)
+  fill         8189 sectors of 0x00 from lba 3 (4192768), blank
+  [ok] verbs::dump streams the device to a file: 4194304 bytes at 669.0 MiB/s
+
+== 5. range checks on a live device ==
+  [ok] a length that is not a whole sector is refused: invalid request: 513 bytes is not a whole number of 512-byte sectors, and uncached access requires every transfer to be a multiple of the logical block size
+  [ok] a read one sector past the end is refused: invalid request: sectors 524288..524289 run past the end of `loop0`, which has 524288
+  [ok] a refused request leaves the agent in step: is_desynchronized = false
+  [ok] the last sector still reads after the refusals: sector 524287: 45 46 49 20 50 41 52 54 00 00 01 00 5c 00 00 00
+
+== 6. write ==
+  skipped: --write was not passed.
+
+== summary ==
+ok    the target is named twice and is not the running system's: loop0 (268435456 bytes)
+ok    block::open takes the device O_EXCL|O_DIRECT: opened `loop0`
+ok    a second exclusive open is refused while the first is held: invalid request: `loop0` is in use: the kernel refused an exclusive open. Something holds it -- a mounted filesystem, a volume stacked on it, or swap. Unmount or deactivate it first, though nothing is mounted on it, so look for a stacked device or swap
+ok    the agent's geometry agrees with sysfs: 268435456 bytes / 512 bytes
+ok    a raw read at the target sector answers: 16 bytes shown above
+ok    verbs::partitions reads a table over the block device: Gpt, 3 partitions
+ok    verbs::dump streams the device to a file: 4194304 bytes at 669.0 MiB/s
+ok    a length that is not a whole sector is refused: invalid request: 513 bytes is not a whole number of 512-byte sectors, and uncached access requires every transfer to be a multiple of the logical block size
+ok    a read one sector past the end is refused: invalid request: sectors 524288..524289 run past the end of `loop0`, which has 524288
+ok    a refused request leaves the agent in step: is_desynchronized = false
+ok    the last sector still reads after the refusals: sector 524287: 45 46 49 20 50 41 52 54 00 00 01 00 5c 00 00 00
+
+11 checks, 0 failed
+
+############ pass 3: the whole read and write path ############
+
+== 2. target ==
+  name         loop0
+  node         /dev/loop0
+  capacity     268435456 bytes (256.0 MiB)
+  geometry     512 logical / 512 physical
+  bus          virtual
+  model        -
+  removable    false
+  read-only    false
+  mounts       -
+  backing file /tmp/pyrographer-blockbench.img
+  [ok] the target is named twice and is not the running system's: loop0 (268435456 bytes)
+
+== 3. open ==
+  [ok] block::open takes the device O_EXCL|O_DIRECT: opened `loop0`
+  [ok] a second exclusive open is refused while the first is held: invalid request: `loop0` is in use: the kernel refused an exclusive open. Something holds it -- a mounted filesystem, a volume stacked on it, or swap. Unmount or deactivate it first, though nothing is mounted on it, so look for a stacked device or swap
+
+== 4. read ==
+  info         268435456 bytes, 512-byte sectors, chip_id None, medium None
+  [ok] the agent's geometry agrees with sysfs: 268435456 bytes / 512 bytes
+  caps         Caps { can_erase: false, has_partitions: true, medium: None, can_verify: true, can_address_raw_lba: true }
+  read-back    Every window is read back off the flash before the next one goes out, so a difference stops the write where it stands.
+  sector 0     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  [ok] a raw read at the target sector answers: 16 bytes shown above
+  table        Gpt, 3 partitions
+               esp                  lba         2048 sectors        40960
+               boot                 lba        43008 sectors        81920
+               rootfs               lba       124928 sectors       204800
+  [ok] verbs::partitions reads a table over the block device: Gpt, 3 partitions
+  dump: 16777216 bytes
+  dump: 2097152/16777216
+  dump: 4194304/16777216
+  dump: 5242880/16777216
+  dump: 7340032/16777216
+  dump: 8388608/16777216
+  dump: 10485760/16777216
+  dump: 12582912/16777216
+  dump: 13631488/16777216
+  dump: 15728640/16777216
+  dump: 16777216/16777216
+  dump: done, 16777216 bytes
+  dumped       16777216 bytes to /tmp/pyrographer-blockbench/loop0-dump.bin in 0.02s (943.4 MiB/s)
+  fill         32765 sectors of 0x00 from lba 3 (16775680), blank
+  [ok] verbs::dump streams the device to a file: 16777216 bytes at 943.4 MiB/s
+
+== 5. range checks on a live device ==
+  [ok] a length that is not a whole sector is refused: invalid request: 513 bytes is not a whole number of 512-byte sectors, and uncached access requires every transfer to be a multiple of the logical block size
+  [ok] a read one sector past the end is refused: invalid request: sectors 524288..524289 run past the end of `loop0`, which has 524288
+  [ok] a refused request leaves the agent in step: is_desynchronized = false
+  [ok] the last sector still reads after the refusals: sector 524287: 45 46 49 20 50 41 52 54 00 00 01 00 5c 00 00 00
+
+== 6. write ==
+  before       00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  saved to     /tmp/pyrographer-blockbench/loop0-before.bin
+  image        4194404 bytes at /tmp/pyrographer-blockbench/image.bin (offset-stamped)
+  plan         lba 0 for 8193 sectors
+               image 4194404 bytes + 412 padding
+               touches Partitions([Overlap { name: "esp", first_lba: 2048, covered: 6145, total: 40960 }])
+               read-back Every window is read back off the flash before the next one goes out, so a difference stops the write where it stands.
+               chip version []
+  [ok] plan_write pads a part-sector image up to whole sectors: 412 bytes of padding
+  [ok] plan_refusal passes a block write with no SoC named: no refusal: there is no loader to be wrong, and the guard ran at the open
+  [FAIL] verbs::flash writes and reads back every window: invalid request: a write must name the SoC it is gated against
+
+stopped: flash: invalid request: a write must name the SoC it is gated against
+  [FAIL] the pass ran to the end: flash: invalid request: a write must name the SoC it is gated against
+
+== summary ==
+ok    the target is named twice and is not the running system's: loop0 (268435456 bytes)
+ok    block::open takes the device O_EXCL|O_DIRECT: opened `loop0`
+ok    a second exclusive open is refused while the first is held: invalid request: `loop0` is in use: the kernel refused an exclusive open. Something holds it -- a mounted filesystem, a volume stacked on it, or swap. Unmount or deactivate it first, though nothing is mounted on it, so look for a stacked device or swap
+ok    the agent's geometry agrees with sysfs: 268435456 bytes / 512 bytes
+ok    a raw read at the target sector answers: 16 bytes shown above
+ok    verbs::partitions reads a table over the block device: Gpt, 3 partitions
+ok    verbs::dump streams the device to a file: 16777216 bytes at 943.4 MiB/s
+ok    a length that is not a whole sector is refused: invalid request: 513 bytes is not a whole number of 512-byte sectors, and uncached access requires every transfer to be a multiple of the logical block size
+ok    a read one sector past the end is refused: invalid request: sectors 524288..524289 run past the end of `loop0`, which has 524288
+ok    a refused request leaves the agent in step: is_desynchronized = false
+ok    the last sector still reads after the refusals: sector 524287: 45 46 49 20 50 41 52 54 00 00 01 00 5c 00 00 00
+ok    plan_write pads a part-sector image up to whole sectors: 412 bytes of padding
+ok    plan_refusal passes a block write with no SoC named: no refusal: there is no loader to be wrong, and the guard ran at the open
+FAIL  verbs::flash writes and reads back every window: invalid request: a write must name the SoC it is gated against
+FAIL  the pass ran to the end: flash: invalid request: a write must name the SoC it is gated against
+
+15 checks, 2 failed
+
+############ pass 4: the mounted case, where O_EXCL must refuse ############
+Mounted /dev/loop0 at /media/gregordinary/152df474-7239-471f-bb5c-11ffd874c997
+
+== 2. target ==
+  name         loop0
+  node         /dev/loop0
+  capacity     268435456 bytes (256.0 MiB)
+  geometry     512 logical / 512 physical
+  bus          virtual
+  model        -
+  removable    false
+  read-only    false
+  mounts       /media/gregordinary/152df474-7239-471f-bb5c-11ffd874c997
+  backing file /tmp/pyrographer-blockbench.img
+  [ok] the target is named twice and is not the running system's: loop0 (268435456 bytes)
+
+== 3. open ==
+  [ok] block::open is refused on a device the kernel holds: invalid request: `loop0` is in use: the kernel refused an exclusive open. Something holds it -- a mounted filesystem, a volume stacked on it, or swap. Unmount or deactivate it first (mounted at /media/gregordinary/152df474-7239-471f-bb5c-11ffd874c997)
+
+the open was refused as expected; there is nothing further to run.
+
+== summary ==
+ok    the target is named twice and is not the running system's: loop0 (268435456 bytes)
+ok    block::open is refused on a device the kernel holds: invalid request: `loop0` is in use: the kernel refused an exclusive open. Something holds it -- a mounted filesystem, a volume stacked on it, or swap. Unmount or deactivate it first (mounted at /media/gregordinary/152df474-7239-471f-bb5c-11ffd874c997)
+
+2 checks, 0 failed
+Unmounted /dev/loop0.
+
+############ done ############

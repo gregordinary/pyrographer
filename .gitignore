@@ -1,0 +1,39 @@
+/target
+/docs/book
+/crates/pyrographer-gui/dist
+**/*.rs.bk
+
+# Vendor blobs and hardware-campaign artifacts. These are Rockchip's own
+# proprietary loaders and U-Boot builds, or byproducts of driving them against
+# real hardware -- none of them are ours to publish, and this repository is
+# MIT/Apache. They are fenced here so a `git add -A` cannot sweep them into a
+# public tree. Keep them out of the repo (or move them out entirely); the code
+# reads the reference loader from an out-of-tree `reference/` directory.
+#
+# Any `.bin` dropped at the repo root is treated as a vendor blob: they keep
+# appearing here (u-boot-rockchip-*.bin, rk3576_*.bin, ...). This is anchored to
+# the root on purpose -- captured hardware *test fixtures* live under `crates/`,
+# and are not fenced.
+/*.bin
+/*.tar.gz
+/maskrom-uboot-experiment/
+/reference/
+
+# Local experiment tooling and working notes, kept out of the published tree by
+# default. Move one in deliberately if it earns a place; it does not belong
+# in-tree just because `git add -A` would take it.
+/dump-factory.sh
+/verify-dump.py
+/RK3576UBOOT.ini
+
+# A machine-to-machine transfer checklist: which files to copy to the flash kit on
+# the other machine, and their checksums. Every artifact it names is fenced above,
+# so the note is a list of things this repository refuses to ship, addressed to one
+# person's laptop.
+/SYNC-TO-FLASHKIT.md
+
+# The exploratory patch behind the finding in internal_docs/architecture.md that
+# nusb's own WebUSB backend can carry everything except a transfer's deadline and
+# its cancellation. The finding is what is documented; this is the experiment that
+# produced it, and a patch against a moving tree rots where prose does not.
+/nusb-webusb-prototype.patch

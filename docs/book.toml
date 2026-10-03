@@ -1,0 +1,14 @@
+[book]
+title = "pyrographer"
+description = "Flashing and recovery toolkit for embedded devices"
+authors = ["Greg"]
+src = "src"
+language = "en"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+# GitHub Pages serves a project site under the repository's name, and the 404 page resolves
+# its stylesheets and links against this prefix.
+site-url = "/pyrographer/"
+git-repository-url = "https://github.com/gregordinary/pyrographer"
