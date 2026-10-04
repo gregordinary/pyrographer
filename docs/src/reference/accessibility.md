@@ -39,7 +39,8 @@ flash is overwritten.
 
 The names on one screen must also be **distinct**. The disk list draws a `Use` button on each
 row, and that button selects the target of a destructive operation. Each button therefore reads
-`Use` and announces the disk it selects, as in `Use /dev/sdb`.
+`Use` and announces the disk it selects, as in `Use /dev/sdb`. A test opens every section of
+every screen and requires each name to appear once.
 
 ### Reasons
 
@@ -60,6 +61,15 @@ draws one flow at a time.
 The write gate places keyboard focus on the field where you type the destination. Its confirm
 button joins the keyboard order only after you type the destination.
 
+### Sections and headings
+
+A control that opens and closes a section reports whether the section is expanded or collapsed.
+Its name is the section's name alone. The triangle before the name is drawn as a shape, so a
+screen reader does not read it out as a character.
+
+A heading is published as a heading, at the level it is drawn at. A screen reader can therefore
+move from one heading to the next.
+
 ### Tabs
 
 The bar that divides the window is exposed as a tab list, and each tab reports whether it is
@@ -78,6 +88,9 @@ A keyboard-focused control is drawn with a ring outside it, which a held-down co
 have.
 
 ## Use of color
+
+The accent color marks what can be pressed and what is selected. Headings are drawn in the text
+color, so a heading does not read as a control.
 
 Wherever color conveys information, text conveys it too. A refused disk reads `running system`
 beside its color, and a sentence under the list states the consequence. The current tab is

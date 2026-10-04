@@ -382,9 +382,10 @@ pub struct IngenicForm {
     pub stage2_addr: String,
     /// Milliseconds to settle after stage1 while DRAM comes up, as typed.
     pub settle_ms: String,
-    /// Whether the bootstrap sub-form is revealed. A boot-ROM board *is*
-    /// discovered, as a row in the device list. The reveal is therefore part of
-    /// that board's own controls, rather than declared the way serial recovery is.
+    /// Whether the bootstrap form is open. It starts open, because uploading the
+    /// stages is the only thing a board in its boot ROM can do. A boot-ROM board
+    /// *is* discovered, as a row in the device list, so the form is drawn under
+    /// that board rather than declared the way serial recovery is.
     pub show: bool,
 }
 
@@ -396,7 +397,7 @@ impl Default for IngenicForm {
             stage2: None,
             stage2_addr: format!("0x{:08x}", ingenic::UBOOT_LOAD_ADDRESS),
             settle_ms: ingenic::DEFAULT_SETTLE_MS.to_string(),
-            show: false,
+            show: true,
         }
     }
 }

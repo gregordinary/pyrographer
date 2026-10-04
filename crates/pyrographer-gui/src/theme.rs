@@ -211,12 +211,23 @@ fn tune(style: &mut Style) {
 
     style.text_styles = [
         (TextStyle::Heading, FontId::proportional(22.0)),
+        (section(), FontId::proportional(17.0)),
         (TextStyle::Body, FontId::proportional(14.5)),
         (TextStyle::Button, FontId::proportional(14.5)),
         (TextStyle::Monospace, FontId::monospace(13.5)),
         (TextStyle::Small, FontId::proportional(12.5)),
     ]
     .into();
+}
+
+/// The text style of a section heading: Devices, a board, the serial console.
+///
+/// It sits between the page title and the body. The stock font ships one weight,
+/// so a heading is told from the text under it by size alone, and a part of a
+/// section (Read, Act, Watch) is body-sized. The color does not mark a heading:
+/// the accent is for what can be pressed.
+pub fn section() -> TextStyle {
+    TextStyle::Name("section".into())
 }
 
 /// The page's inset: how far the content stands off the window's edge.

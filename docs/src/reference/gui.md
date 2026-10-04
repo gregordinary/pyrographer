@@ -35,6 +35,22 @@ already running continues behind the plan, and its *Cancel* is the only control 
 second plan is waiting behind the one on screen, the screen says so. Canceling the first plan
 then does not move you into the second without notice.
 
+### Sections that open and close
+
+A name drawn in the accent color, with a triangle before it, opens and closes the section under
+it. Click the name to open the section, and click it again to close it. The name stays where it
+is, so the control that closed a section is the one that opens it again. A screen reader
+announces each one as a button, expanded or collapsed.
+
+Some sections start closed: **Disks**, **Partition table**, **Firmware**, and both sections on
+the **Serial** tab. They hold tools for a particular job, and open when you ask for them.
+
+### Forms
+
+In a form, every label stands in one column and every field and button starts on one line.
+Under the fields is the button that acts on them. A section's headings are announced as
+headings, so a screen reader can move from one to the next.
+
 ## Choosing a board
 
 The list shows every Rockchip and Ingenic board in a boot or recovery mode. While no job is
@@ -114,7 +130,7 @@ drawn disabled, with the reason.
 ## Uploading a loader
 
 A board in maskrom mode runs the BootROM, which serves no flash commands, so the board needs a
-loader first. Select the board and use *Upload loader...*, which runs the same upload as the CLI's
+loader first. Select the board, and the panel under it offers *Upload loader...*. It runs the same upload as the CLI's
 `db`. It asks for the loader file, rkbin's `*_loader.bin` for the SoC, and parses the file as soon
 as you pick it. A file that is not an RKBOOT loader is refused at the dialog, before any device is
 opened. The upload runs as a job, with a progress bar and a *Cancel* that stops it at the next
@@ -130,11 +146,12 @@ prove what the loader does once it runs.
 
 ### Raw stages
 
-*Raw stages...* uploads bare stage files, matching the CLI's `db --code471` and `--code472`.
-Mainline U-Boot's binman emits bare `u-boot-rockchip-usb471.bin` and `u-boot-rockchip-usb472.bin`
-files with no container, which *Upload loader...* refuses. *Raw stages...* takes them as two
-separate files. Stage 471 initializes DRAM, and stage 472 runs after it. At least one is
-required, and 471 always goes first.
+**Raw stages (no container)**, in the same panel, uploads bare stage files, matching the CLI's
+`db --code471` and `--code472`. It starts closed. Mainline U-Boot's binman emits bare
+`u-boot-rockchip-usb471.bin` and `u-boot-rockchip-usb472.bin` files with no container, which
+*Upload loader...* refuses. The form takes them as two separate files, *Stage 471* and
+*Stage 472*. Stage 471 initializes DRAM, and stage 472 runs after it. At least one is required,
+and 471 always goes first.
 
 Raw stages load a full U-Boot into the board's DRAM over USB. The board then answers on its
 serial port rather than on the bus, as [The serial console](#the-serial-console) describes. Bare
@@ -154,17 +171,18 @@ CLI's `db`. The window's own run of this flow is `[UNVERIFIED]` against hardware
 
 ## Bootstrapping an Ingenic board
 
-An Ingenic board in its boot ROM has no flash commands. Select the board and use
-*Bootstrap to DFU...* to open a form that brings it to DFU. It is the window's counterpart of the
-CLI's `usbboot`. The form has these fields:
+An Ingenic board in its boot ROM has no flash commands. Select the board, and the
+**Bootstrap to DFU** form under it brings the board to DFU. The form starts open, because the
+upload is the only thing a boot ROM can do. It is the window's counterpart of the CLI's
+`usbboot`. The form has these fields:
 
 | Field | What it holds |
 |---|---|
-| Stage1 | The DRAM-init SPL, which is required |
-| Stage1 load address | Where the SPL loads and runs |
-| Stage2 | The DFU-capable U-Boot. Without it, the board only initializes DRAM and does not re-enumerate. |
-| Stage2 load address | Where U-Boot loads and runs in DRAM |
-| DRAM settle (ms) | The wait after stage1 for DRAM to come up. The community value is around 2000 ms. |
+| Stage 1 | The DRAM-init SPL, which is required |
+| Stage 1 address | Where the SPL loads and runs |
+| Stage 2 | The DFU-capable U-Boot. Without it, the board only initializes DRAM and does not re-enumerate. |
+| Stage 2 address | Where U-Boot loads and runs in DRAM |
+| DRAM settle | The wait in milliseconds after stage 1 for DRAM to come up. The community value is around 2000 ms. |
 
 The load addresses default to thingino-dfu's family-wide values, `0x80001800` for the SPL and
 `0x80100000` for U-Boot. If your build links its stages elsewhere, change them. *Bootstrap...*
@@ -175,12 +193,13 @@ This flow is `[UNVERIFIED]` against hardware.
 
 ## Reading a board
 
-Five buttons each query the board and show the answer:
+The **Read** part of the panel under an open board holds five buttons. Each one queries the board
+and shows the answer:
 
 - *Flash info* reports the flash ID and geometry, and names the storage medium on the geometry
   line.
-- *Partition table* lists the partitions. Read it first, because it lets you aim every other verb
-  by partition name.
+- *Partitions* lists the partitions under the board. Read it first, because it lets you aim every
+  other verb by partition name.
 - *Chip version* shows the loader's answer about which SoC it is on.
 - *Capability* shows the loader's own report of what it supports, including any flag pyrographer
   has no name for. Nothing is gated on it.
@@ -197,16 +216,17 @@ times too small.
 
 ### Reset modes
 
-Beside these is the button that ends the session, with a *Mode* menu next to it. The mode decides
-whether the board comes back, comes back as a disk, or stays off. The button's label names the
-selected ending: *Reboot*, *Reboot into USB mass storage*, *Power off*, or *Reboot into maskrom*.
+The **Device** part of the panel holds the button that ends the session, after its *Reset mode*
+menu. The mode decides whether the board comes back, comes back as a disk, or stays off. The
+button's label names the selected ending: *Reboot*, *Reboot into USB mass storage*, *Power off*,
+or *Reboot into maskrom*.
 
 Any mode other than the plain reboot shows a caution. No board has answered those subcodes. They
 write no flash, but each one leaves the board in a mode the open session cannot drive.
 
 ### Disabled controls
 
-*Erase* is drawn disabled, with the reason beside it. No board has confirmed what the erase
+*Erase*, in the **Device** part, is drawn disabled, with the reason under it. No board has confirmed what the erase
 command does to a range, and an erase with the wrong range semantics destroys data rather than
 failing.
 
@@ -308,8 +328,8 @@ section starts closed: click its name to open it. Repair and authoring are for a
 table is already damaged or wrong. An ordinary dump or flash needs neither.
 
 A partition table sits at fixed sectors of a device-wide LBA space. A DFU board reaches its
-flash only by named region and has no such space. On a DFU board, the section's buttons are
-drawn disabled, and the reason is shown above them.
+flash only by named region and has no such space. On a DFU board, the repair buttons and
+*Author table...* are drawn disabled, and the reason is shown above them.
 
 ### Repairing a damaged table
 
@@ -330,12 +350,13 @@ has no other copy to be rebuilt from. Author a fresh table instead.
 
 ### Authoring a table
 
-*Author a fresh table...* opens a form with these fields:
+**Author a fresh table**, inside the section, opens a form with these fields:
 
 | Field | Choices |
 |---|---|
 | Format | GPT, or Rockchip parameter |
-| Source | Native layout, mtdparts line, or parameter text |
+| From | Native layout, mtdparts line, or parameter text |
+| File | The layout file |
 | Medium | eMMC or raw NAND, for a Rockchip parameter table only |
 
 Parameter text is an existing parameter block's whole text, kept verbatim, so `FIRMWARE_VER` and
@@ -380,7 +401,8 @@ On a DFU board, both firmware buttons are disabled, and the reason is shown abov
 
 StarFive's JH7110 boards, such as the VisionFive 2 and the Milk-V Mars CM, recover over a serial
 line. Their BootROM has no USB and acts as an XMODEM receiver, so the board does not appear in the
-device list. Recovery is on the **Serial** tab, behind *Start serial recovery...*.
+device list. Recovery is the **StarFive recovery (serial)** section of the **Serial** tab, which
+starts closed.
 
 Strap the board into UART recovery, connect a USB-serial adapter, and fill in the form:
 
@@ -436,8 +458,8 @@ The RAM boot is `[UNVERIFIED]` against hardware.
 
 The serial console drives a bootloader prompt over a serial line. Its section is on the
 **Serial** tab after StarFive recovery, and you reach it the same way, by naming a port. A serial
-line does not announce what is connected, so the section shows only an *Open serial console...*
-button until you click it. The serial console is `[UNVERIFIED]` against hardware.
+line does not announce what is connected, so the **Serial console** section starts closed. The
+serial console is `[UNVERIFIED]` against hardware.
 
 ### Watching the console
 
@@ -455,8 +477,9 @@ lists.
 
 ### Driving a U-Boot prompt
 
-*Drive a U-Boot prompt...* shows the remaining controls and their fields, including the prompt
-string and a gadget's block device.
+**U-Boot prompt**, a part of the section that starts closed, holds the remaining controls. Each row
+is a field and the buttons that use it. The fields are the prompt string, the *Gadget device* a
+gadget exposes, the *Boot order* to set, and the *Command* to type.
 
 #### Gadgets
 

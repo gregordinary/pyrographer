@@ -117,15 +117,59 @@ fn screen_header(ui: &mut egui::Ui, title: &str, subtitle: &str, tone: Tone) {
     ui.separator();
 }
 
-/// A section heading, in the cool accent.
+/// How deep a heading, or a toggle standing in for one, sits on the page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// A section of a tab: Devices, Disks, a board, the serial console.
+    Section,
+    /// A part of a section: Read, Act, Watch, the U-Boot prompt, the firmware tools.
+    Part,
+}
+
+impl Level {
+    /// The text style a heading at this level is drawn in.
+    fn style(self) -> egui::TextStyle {
+        match self {
+            Self::Section => crate::theme::section(),
+            Self::Part => egui::TextStyle::Body,
+        }
+    }
+
+    /// The heading level an assistive technology is told: the page title is 1.
+    fn depth(self) -> usize {
+        match self {
+            Self::Section => 2,
+            Self::Part => 3,
+        }
+    }
+}
+
+/// A heading that does not open or shut anything, in the text color.
 ///
-/// The accent is the instrument chrome that is always on screen. The heat scale is
-/// spent only where flash is at stake. The accent gives an idle window (no board,
-/// no plan, nothing warm to show) the palette's identity, where it would otherwise
-/// be a wall of gray.
-fn section_label(ui: &mut egui::Ui, text: impl Into<String>) {
-    let accent = ui.visuals().hyperlink_color;
-    ui.label(egui::RichText::new(text.into()).color(accent).strong());
+/// The accent is for what can be pressed: a link, the current tab, a section
+/// toggle. A heading in the accent would read as one more thing to click. A
+/// section is therefore told by size and a part by the strong text color.
+///
+/// The node is published as a heading at its level, so a screen reader can move
+/// from one heading to the next. A plain label carries no such role, and SC 1.3.1
+/// asks that the structure a sighted reader sees be in the tree as well.
+///
+/// egui keeps a label's text as its node's value, which is what a label is read
+/// by. A heading is read by its name, so the text moves there.
+fn heading(ui: &mut egui::Ui, text: impl Into<String>, level: Level) -> egui::Response {
+    let text: String = text.into();
+    let rich = egui::RichText::new(text.clone()).text_style(level.style());
+    let response = match level {
+        Level::Section => ui.label(rich),
+        Level::Part => ui.label(rich.strong()),
+    };
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::Heading);
+        node.set_level(level.depth());
+        node.clear_value();
+        node.set_label(text);
+    });
+    response
 }
 
 /// A paragraph of explanatory prose, at full text contrast.
@@ -233,25 +277,219 @@ fn describe(response: &egui::Response, text: &str) {
     });
 }
 
-/// Give a control that has no text of its own the name drawn beside it.
+/// The control that opens and shuts a section or a part: a triangle, then its name.
 ///
-/// A [`egui::TextEdit`] and a [`egui::DragValue`] reach the accessibility tree
-/// with `label: None`, because egui has no text to give them. A screen reader
-/// announces the role and stops. The `ui.label` drawn beside one is a separate
-/// node with no relation to it.
+/// It is the one way anything on the page opens and shuts. It stands where the
+/// heading would, and it stays there when pressed, so the pointer that opened a
+/// section is already on the control that shuts it, and keyboard focus is not lost.
 ///
-/// `labelled_by` relates the two, and it works here because these controls have
-/// no direct label. When a node has a direct label, `accesskit_consumer` composes
-/// its name from that label. When it has none, it falls back to the `labelled_by`
-/// targets. On a button the same call would be inert, because the button's own
-/// text wins. This helper is therefore for fields only.
-fn named_field(
-    ui: &mut egui::Ui,
-    name: &str,
-    add: impl FnOnce(&mut egui::Ui) -> egui::Response,
-) -> egui::Response {
-    let label = ui.label(name);
-    add(ui).labelled_by(label.id)
+/// It is drawn as a heading at its level, in the accent, with no frame at rest.
+/// The accent marks what can be pressed, and a heading in it is a heading that
+/// opens. Hover and focus draw the frame every button has, and the button is as
+/// tall as any other, so the target is the size of one. Its sideways padding is
+/// [`DISCLOSURE_PADDING`], narrower than a button's, so the triangle stands only
+/// a few points in from the line the headings and prose around it start on. The
+/// frame starts on that line. Anything allocated to its left would widen the
+/// region it is drawn in, and move every row after it off the line.
+///
+/// The open or shut state is drawn as a shape and published as a state. Drawn as
+/// text, a `>` or a `v` is part of the button's name. A screen reader then says
+/// "greater than, Disks, button" and gives no state at all. Here the triangle is
+/// painted into a slot the button reserves, so the name is the section's name
+/// alone. AccessKit's `expanded` carries the state, so a screen reader says
+/// "Disks, button, collapsed". The visible text is the whole accessible name,
+/// which SC 2.5.3 asks for.
+fn disclosure(ui: &mut egui::Ui, name: &str, open: bool, level: Level) -> egui::Response {
+    let accent = ui.visuals().hyperlink_color;
+    let icon = egui::Id::new("disclosure triangle");
+    let side = ui.text_style_height(&level.style()) * 0.5;
+    let text = egui::RichText::new(name)
+        .text_style(level.style())
+        .color(accent);
+    let laid = ui
+        .scope(|ui| {
+            ui.spacing_mut().button_padding.x = DISCLOSURE_PADDING;
+            egui::Button::new((egui::Atom::custom(icon, egui::vec2(side, side)), text))
+                .frame_when_inactive(false)
+                .atom_ui(ui)
+        })
+        .inner;
+
+    if let Some(slot) = laid.rect(icon) {
+        let points = if open {
+            vec![slot.left_top(), slot.right_top(), slot.center_bottom()]
+        } else {
+            vec![slot.left_top(), slot.left_bottom(), slot.right_center()]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            points,
+            accent,
+            egui::Stroke::NONE,
+        ));
+    }
+
+    let response = laid.response;
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_expanded(open);
+    });
+    response
+}
+
+/// How far a section toggle's triangle stands in from its frame, in points.
+///
+/// A button's padding is 12. At 12 a toggle's triangle would stand that far in
+/// from the headings and prose it is a heading among, and the eye reads the step.
+const DISCLOSURE_PADDING: f32 = 4.0;
+
+/// A section's label column: the line every control in a form starts on.
+///
+/// A row drawn as a label and then its control starts the control wherever the
+/// label ends, so a column of controls zig-zags with the lengths of their labels.
+/// Here every label sits in a cell as wide as the longest label in the section, and
+/// the controls start on one line.
+///
+/// The width is a section's own, not one for the whole window. Fixed for the
+/// window, it is set by the window's longest label, and a short label such as
+/// "Port" ends up far from its field. A section passes every label it can draw,
+/// including those of a part that is shut at the moment, so opening a part never
+/// moves a control already on screen.
+#[derive(Clone, Copy)]
+struct Column {
+    /// The width of the label cell, in points.
+    width: f32,
+}
+
+impl Column {
+    /// A column as wide as the widest of `labels`, in the body text.
+    fn fit(ui: &egui::Ui, labels: &[&str]) -> Self {
+        let width = labels
+            .iter()
+            .map(|label| text_width(ui, label, egui::TextStyle::Body))
+            .fold(0.0, f32::max);
+        Self { width }
+    }
+
+    /// The same column, widened if it must hold `text` in `style` as well.
+    fn holding(self, ui: &egui::Ui, text: &str, style: egui::TextStyle) -> Self {
+        Self {
+            width: self.width.max(text_width(ui, text, style)),
+        }
+    }
+
+    /// The label cell, holding whatever `add` draws.
+    fn cell_with<R>(self, ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        ui.allocate_ui_with_layout(
+            egui::vec2(self.width, ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_width(self.width);
+                add(ui)
+            },
+        )
+        .inner
+    }
+
+    /// The label cell. It returns the label, for a field to be named by.
+    ///
+    /// A label the section did not measure would run past the cell and push its
+    /// control off the line, so a debug build stops on one. Every form is drawn by
+    /// a test, so a label missing from its section's list fails there.
+    fn cell(self, ui: &mut egui::Ui, label: impl Into<egui::WidgetText>) -> egui::Response {
+        let label = label.into();
+        debug_assert!(
+            text_width(ui, label.text(), egui::TextStyle::Body) <= self.width + 0.5,
+            "{:?} is wider than its column, so the section's list of labels is missing it",
+            label.text()
+        );
+        self.cell_with(ui, |ui| ui.label(label))
+    }
+
+    /// A row whose label is a section heading: a frame's title, with what it is
+    /// the title of on the controls' line.
+    fn titled<R>(self, ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        debug_assert!(
+            text_width(ui, title, crate::theme::section()) <= self.width + 0.5,
+            "{title:?} is wider than its column, so the frame's list of titles is missing it"
+        );
+        ui.horizontal(|ui| {
+            self.cell_with(ui, |ui| heading(ui, title, Level::Section));
+            add(ui)
+        })
+        .inner
+    }
+
+    /// A row: `label` in the column, then whatever `add` draws.
+    fn row<R>(
+        self,
+        ui: &mut egui::Ui,
+        label: impl Into<egui::WidgetText>,
+        add: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> R {
+        ui.horizontal(|ui| {
+            self.cell(ui, label);
+            add(ui)
+        })
+        .inner
+    }
+
+    /// A field: `label` in the column, naming the control `add` draws.
+    ///
+    /// A [`egui::TextEdit`], a [`egui::DragValue`] and a [`egui::ComboBox`] reach
+    /// the accessibility tree with `label: None`, because egui has no text to give
+    /// them. A screen reader announces the role and stops. The label drawn beside
+    /// one is a separate node with no relation to it.
+    ///
+    /// `labelled_by` relates the two, and it works here because these controls
+    /// have no direct label. When a node has a direct label, `accesskit_consumer`
+    /// composes its name from that label. When it has none, it falls back to the
+    /// `labelled_by` targets. On a button the same call would be inert, because the
+    /// button's own text wins. `add` therefore returns the field, and any buttons
+    /// it draws after the field carry their own names.
+    fn field(
+        self,
+        ui: &mut egui::Ui,
+        label: &str,
+        add: impl FnOnce(&mut egui::Ui) -> egui::Response,
+    ) -> egui::Response {
+        ui.horizontal(|ui| {
+            let label = self.cell(ui, label);
+            add(ui).labelled_by(label.id)
+        })
+        .inner
+    }
+
+    /// Nothing in the column, and `add` on the controls' line: an action row, or
+    /// a sentence about the rows above it.
+    ///
+    /// `add` is given a vertical layout, so a sentence wraps. A row of buttons is
+    /// drawn in a `ui.horizontal` inside it.
+    ///
+    /// The empty cell is space, not an empty label, so it adds no node to the
+    /// accessibility tree.
+    fn under<R>(self, ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        ui.horizontal(|ui| {
+            ui.add_space(self.width + ui.spacing().item_spacing.x);
+            ui.vertical(add).inner
+        })
+        .inner
+    }
+}
+
+/// The width of a field that takes a path, a name or a command.
+///
+/// Fields that do the same job share a width, so the buttons that follow them on
+/// their rows line up as well.
+const FIELD_WIDTH: f32 = 220.0;
+
+/// The width of a field that takes a short value: an address, a count, a SoC.
+const SHORT_WIDTH: f32 = 140.0;
+
+/// How wide `text` is in `style`, on one line.
+fn text_width(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    egui::WidgetText::from(text)
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, style)
+        .size()
+        .x
 }
 
 /// A reason that guards a destructive act, drawn as a sentence.
@@ -630,12 +868,30 @@ fn flash_tab(app: &mut App, ui: &mut egui::Ui) {
         board(app, ui, Which::Target);
         ui.add_space(8.0);
 
-        // Idle, running a job, or finished: in all three the verbs panel is
-        // drawn. A desynchronized board draws it **disabled, with the reason**,
-        // rather than vanishing -- a panel that disappears teaches nothing, and
-        // the buttons gray themselves out on the connection state anyway.
+        // Under the frame that says what the device is, the frame that says
+        // what can be done with it. A board in a boot ROM that has not been
+        // opened is given the upload that brings it out. Otherwise -- idle,
+        // running a job, or finished -- the verbs panel is drawn. A
+        // desynchronized board draws it **disabled, with the reason**, rather
+        // than vanishing: a panel that disappears teaches nothing, and the
+        // buttons gray themselves out on the connection state anyway.
         let connection = &app.board(Which::Target).connection;
-        if connection.is_idle() || connection.is_desynchronized() || app.session.job.is_some() {
+        let mode = app
+            .board(Which::Target)
+            .device
+            .as_ref()
+            .and_then(Chosen::usb)
+            .map(|device| device.mode);
+        if !connection.is_idle() && mode == Some(Mode::Maskrom) {
+            maskrom_panel(app, ui);
+            ui.add_space(8.0);
+        } else if !connection.is_idle() && mode == Some(Mode::BootRom) {
+            ingenic_panel(app, ui);
+            ui.add_space(8.0);
+        } else if connection.is_idle()
+            || connection.is_desynchronized()
+            || app.session.job.is_some()
+        {
             verbs_panel(app, ui);
             ui.add_space(8.0);
         }
@@ -727,7 +983,7 @@ fn serial_tab(app: &mut App, ui: &mut egui::Ui) {
 #[cfg(not(target_arch = "wasm32"))]
 fn devices(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        section_label(ui, "Devices");
+        heading(ui, "Devices", Level::Section);
         // The bus is polled at rest anyway. The button is for the moment somebody
         // plugs a board in and does not want to wait for the next second to come
         // round.
@@ -867,9 +1123,7 @@ fn device_rows(app: &mut App, ui: &mut egui::Ui) {
 fn disks(app: &mut App, ui: &mut egui::Ui) {
     let mut show = app.session.disks.show;
     ui.horizontal(|ui| {
-        let arrow = if show { "v" } else { ">" };
-        if ui
-            .button(format!("{arrow}  Disks"))
+        if disclosure(ui, "Disks", show, Level::Section)
             .explain(
                 "This machine's block devices, such as an SD card in a reader or a board that \
                  has come up as mass storage. Unlike every other target here, the operating \
@@ -1043,21 +1297,28 @@ fn disks(app: &mut App, ui: &mut egui::Ui) {
         } else {
             format!("{} devices", empty.len())
         };
-        egui::CollapsingHeader::new(format!("{count} with no medium"))
-            .id_salt("no_medium")
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(empty.join(", "))
-                        .monospace()
-                        .color(ui.visuals().weak_text_color()),
-                );
-            })
-            .header_response
+        // Whether the list is open is the window's business alone, so it is kept
+        // in egui's memory, as egui's own collapsing header keeps it.
+        let id = ui.id().with("no_medium");
+        let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
+        if disclosure(ui, &format!("{count} with no medium"), open, Level::Part)
             .explain(
                 "An unbound loop device, or a card reader with no card in it. These have nothing \
-             to read or write, so they get no row. If a card you inserted is among them, the \
-             system does not detect it.",
+                 to read or write, so they get no row. If a card you inserted is among them, the \
+                 system does not detect it.",
+            )
+            .clicked()
+        {
+            open = !open;
+            ui.data_mut(|data| data.insert_temp(id, open));
+        }
+        if open {
+            ui.label(
+                egui::RichText::new(empty.join(", "))
+                    .monospace()
+                    .color(ui.visuals().weak_text_color()),
             );
+        }
     }
 }
 
@@ -1389,7 +1650,7 @@ fn disk_label_note(disk: &BlockDevice, ui: &mut egui::Ui) {
 #[cfg(target_arch = "wasm32")]
 fn devices(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        section_label(ui, "Devices");
+        heading(ui, "Devices", Level::Section);
         // No poll behind this, unlike the native window's. `getDevices` is a
         // question with an answer, not a bus that can be watched, so the list is
         // taken at startup and whenever somebody asks -- here, or by granting a
@@ -1528,29 +1789,41 @@ fn disk_label(disk: &BlockDevice, ui: &mut egui::Ui) {
     }
     if disk.carries_running_system {
         ui.colored_label(ui.visuals().error_fg_color, "running system");
-        // Drawn, not hovered. There is no override for this one, and a person is
-        // owed the reason where they cannot miss it.
-        guard(
-            ui,
-            "This disk holds the running system, directly or through a stack of device-mapper \
-             layers. It cannot be opened, and there is no override. A write to it can pass its \
-             read-back and still bring the machine down minutes later, with no error reported.",
-        );
     } else if disk.is_mounted() {
         ui.colored_label(
             ui.visuals().warn_fg_color,
             format!("mounted at {}", disk.mounts.join(", ")),
         );
+    }
+    if disk.read_only {
+        ui.weak("read-only");
+    }
+}
+
+/// What follows from a disk's running-system or mounted state, as sentences under
+/// the row that names the state.
+///
+/// Drawn, not hovered. There is no override for the running system, and a person
+/// is owed the reason where they cannot miss it.
+fn disk_guards(disk: &BlockDevice, column: Column, ui: &mut egui::Ui) {
+    if disk.carries_running_system {
+        column.under(ui, |ui| {
+            guard(
+                ui,
+                "This disk holds the running system, directly or through a stack of \
+                 device-mapper layers. It cannot be opened, and there is no override. A write \
+                 to it can pass its read-back and still bring the machine down minutes later, \
+                 with no error reported.",
+            );
+        });
+    } else if disk.is_mounted() {
         // **Worded as an obstacle, not as a complete remedy**, which is the
         // wording `Refusal::warning(Held)` already settled on and the reason it
         // did: a disk can carry more than one of these, so "unmount it and open it
         // again" is a promise that fails for one that is also write-protected.
         // The weaker sentence is the true one, and one fact should not be worded
         // two ways a hundred lines apart.
-        guard(ui, Refusal::Held.warning(1));
-    }
-    if disk.read_only {
-        ui.weak("read-only");
+        column.under(ui, |ui| guard(ui, Refusal::Held.warning(1)));
     }
 }
 
@@ -1585,6 +1858,14 @@ fn device_line(device: &Chosen) -> String {
 /// disk has the whole uniform surface and nothing to disable. It is therefore a
 /// device in the slot, not a second window pane, and every verb is drawn once
 /// for both.
+///
+/// The frame holds what the device *is*, as a column of labels and values, the
+/// way a plan screen lists them. What can be done with it is a frame of its own
+/// below: the verbs for an open device, or the upload that brings a board out of
+/// its boot ROM. The title is the first label. Every device frame measures its
+/// column against every title, so a board to copy and the board it overwrites
+/// line up when they are drawn one above the other, which is where the two are
+/// compared.
 fn board(app: &mut App, ui: &mut egui::Ui, which: Which) {
     let disk = app
         .board(which)
@@ -1597,11 +1878,15 @@ fn board(app: &mut App, ui: &mut egui::Ui, which: Which) {
         (Which::Source, false) => "Board to copy",
         (Which::Source, true) => "Disk to copy",
     };
+    let column = ["Board", "Disk", "Board to copy", "Disk to copy"]
+        .into_iter()
+        .fold(
+            Column::fit(ui, &["Flash", "Loader says", "Partitions"]),
+            |column, title| column.holding(ui, title, crate::theme::section()),
+        );
 
     ui.group(|ui| {
-        ui.horizontal(|ui| {
-            section_label(ui, title);
-
+        column.titled(ui, title, |ui| {
             let Some(device) = app.board(which).device.clone() else {
                 ui.weak("none chosen");
                 return;
@@ -1649,6 +1934,10 @@ fn board(app: &mut App, ui: &mut egui::Ui, which: Which) {
             }
         });
 
+        if let Some(disk) = app.board(which).device.as_ref().and_then(Chosen::disk) {
+            disk_guards(disk, column, ui);
+        }
+
         // Said while the disk is open, because it is the difference between this
         // target and every other one: the kernel is holding it for us, and
         // nothing else on the machine can have it back until this slot is closed.
@@ -1656,70 +1945,45 @@ fn board(app: &mut App, ui: &mut egui::Ui, which: Which) {
         // one command -- and a window holds it for as long as somebody leaves it
         // open.
         if disk && app.board(which).connection.is_idle() {
-            ui.weak(
-                "Held exclusively (O_EXCL) while it is open, so nothing else on this machine \
-                 can mount or write it. Close it to release it.",
-            );
+            column.under(ui, |ui| {
+                measured(ui, |ui| {
+                    ui.weak(
+                        "Held exclusively (O_EXCL) while it is open, so nothing else on this \
+                         machine can mount or write it. Close it to release it.",
+                    );
+                });
+            });
         }
 
         if let Some(flash) = &app.board(which).flash {
-            ui.label(geometry(flash));
+            column.row(ui, "Flash", |ui| ui.label(geometry(flash)));
         }
         // A disk runs no loader, so there is nothing here that could have
         // answered -- and a row that is reliably empty is a row somebody learns
         // to skip.
         if let Some(version) = &app.board(which).chip_version {
-            ui.horizontal(|ui| {
-                ui.label("Loader says");
-                ui.monospace(hex(version));
+            column.row(ui, "Loader says", |ui| {
+                ui.monospace(hex(version)).explain(
+                    "The loader's own answer about which SoC it runs on, shown raw. The reply's \
+                     layout is unverified, so pyrographer shows it without interpreting it.",
+                );
                 ui.monospace(format!("\"{}\"", ascii(version)));
-            })
-            .response
-            .explain(
-                "The loader's own answer about which SoC it runs on, shown raw. The reply's \
-                 layout is unverified, so pyrographer shows it without interpreting it.",
-            );
+            });
         }
         if let Table::Read(table) = &app.board(which).table {
             partitions(
                 table,
                 app.board(which).sector_size(),
                 app.board(which).flash.as_ref(),
+                column,
+                which,
                 ui,
             );
         }
         if matches!(app.board(which).table, Table::Absent) {
-            ui.weak("This board has no partition table.");
-        }
-
-        // A maskrom board being sent bare stages: the reveal-on-demand form, drawn
-        // under the board it acts on so its trigger and its fields are one reading
-        // order -- the same shape the Ingenic bootstrap form below has.
-        if which == Which::Target
-            && app.maskrom.show
-            && app
-                .board(which)
-                .device
-                .as_ref()
-                .and_then(Chosen::usb)
-                .is_some_and(|device| device.mode == Mode::Maskrom)
-        {
-            maskrom_stage_form(app, ui);
-        }
-
-        // A boot-ROM board being bootstrapped to DFU: the reveal-on-demand form,
-        // drawn under the board it acts on so its trigger and its fields are one
-        // reading order.
-        if which == Which::Target
-            && app.ingenic.show
-            && app
-                .board(which)
-                .device
-                .as_ref()
-                .and_then(Chosen::usb)
-                .is_some_and(|device| device.mode == Mode::BootRom)
-        {
-            ingenic_bootstrap_form(app, ui);
+            column.row(ui, "Partitions", |ui| {
+                ui.weak("This board has no partition table.")
+            });
         }
     });
 }
@@ -1727,98 +1991,33 @@ fn board(app: &mut App, ui: &mut egui::Ui, which: Which) {
 /// Open, close, and what state the connection is in.
 fn connection_controls(app: &mut App, ui: &mut egui::Ui, which: Which) {
     // A board flagged maskrom may be exactly that, or a loader that keeps the
-    // flag even, as the RK3576 SPL does -- so the target offers both doors.
-    // Upload loader is for the BootROM the flag may truthfully name; the Open
-    // below probes the claim, because a running loader answers TEST_UNIT_READY
-    // and a BootROM's endpoints -- the same pair a loader presents -- have
-    // nothing behind them and fault. The upload is offered only for the target
-    // board: a clone cannot copy from a board that cannot yet be read.
-    let is_maskrom = app
+    // flag even, as the RK3576 SPL does -- so it can be opened as well as given a
+    // loader. The upload is in the frame below; the Open here probes the claim,
+    // because a running loader answers TEST_UNIT_READY and a BootROM's endpoints
+    // -- the same pair a loader presents -- have nothing behind them and fault.
+    let mode = app
         .board(which)
         .device
         .as_ref()
         .and_then(Chosen::usb)
-        .is_some_and(|device| device.mode == Mode::Maskrom);
-    if which == Which::Target && is_maskrom {
-        if app.is_bootstrapping() {
-            ui.spinner();
-            ui.weak("uploading loader");
-            return;
-        }
-        if ui
-            .add_enabled(
-                app.session.job.is_none(),
-                egui::Button::new("Upload loader..."),
-            )
-            .explain(
-                "Upload a loader into SRAM to bring this board from maskrom to loader mode. \
-                 Every verb can then drive it. This button takes an rkbin container \
-                 (_loader.bin), which names its own sections.",
-            )
-            .clicked()
-        {
-            app.upload_loader();
-        }
-        // **The other form of the same upload**, and the one the RAM-boot path is
-        // built on: mainline U-Boot's binman emits bare 471 and 472 blobs with no
-        // container around them, which the picker above parses and refuses. It is
-        // a form rather than a button because it takes two files.
-        let label = if app.maskrom.show {
-            "Hide raw stages"
-        } else {
-            "Raw stages..."
-        };
-        if ui
-            .add_enabled(app.session.job.is_none(), egui::Button::new(label))
-            .explain(
-                "Upload bare usb471/usb472 stage files instead of a container. Mainline U-Boot \
-                 builds these, and they load a full U-Boot into DRAM over USB.",
-            )
-            .clicked()
-        {
-            app.maskrom.show = !app.maskrom.show;
-        }
-        // No return: the open controls below stay on offer, because the flag
-        // may belong to a loader that never set it.
+        .map(|device| device.mode);
+    if which == Which::Target && mode == Some(Mode::Maskrom) && app.is_bootstrapping() {
+        ui.spinner();
+        ui.weak("uploading loader");
+        return;
     }
 
     // An Ingenic boot ROM has no reachable flash and cannot be opened as a
     // FlashAgent -- it must be bootstrapped to DFU first, unlike the maskrom flag
-    // above whose board might already be a loader. So the target offers the
-    // bootstrap form in place of Open; the block verbs come after the board
-    // re-enumerates as a DFU gadget.
-    {
-        let is_bootrom = app
-            .board(which)
-            .device
-            .as_ref()
-            .and_then(Chosen::usb)
-            .is_some_and(|device| device.mode == Mode::BootRom);
-        if which == Which::Target && is_bootrom {
-            if app.is_bootstrapping_ingenic() {
-                ui.spinner();
-                ui.weak("bootstrapping");
-                return;
-            }
-            let label = if app.ingenic.show {
-                "Hide bootstrap"
-            } else {
-                "Bootstrap to DFU..."
-            };
-            if ui
-                .add_enabled(app.session.job.is_none(), egui::Button::new(label))
-                .explain(
-                    "Upload a DRAM-init SPL and a DFU-capable U-Boot to bring this board from \
-                     its boot ROM to DFU mode. Its flash is then reachable as named \
-                     alt-settings.",
-                )
-                .clicked()
-            {
-                app.ingenic.show = !app.ingenic.show;
-            }
-            // No Open: a boot-ROM board has no flash to open until it is DFU.
-            return;
+    // above whose board might already be a loader. So the target offers no Open;
+    // the bootstrap is in the frame below, and the block verbs come after the
+    // board re-enumerates as a DFU gadget.
+    if which == Which::Target && mode == Some(Mode::BootRom) {
+        if app.is_bootstrapping_ingenic() {
+            ui.spinner();
+            ui.weak("bootstrapping");
         }
+        return;
     }
 
     if app.is_opening(which) {
@@ -1842,8 +2041,10 @@ fn connection_controls(app: &mut App, ui: &mut egui::Ui, which: Which) {
         return;
     }
 
+    // A state, not something to press, so it is drawn in the secondary text
+    // color: the accent is for what can be pressed.
     if connection.is_idle() {
-        ui.colored_label(ui.visuals().hyperlink_color, "open");
+        ui.weak("open");
         if ui.button("Close").clicked() {
             app.close(which);
         }
@@ -1853,6 +2054,78 @@ fn connection_controls(app: &mut App, ui: &mut egui::Ui, which: Which) {
     if ui.button("Open").clicked() {
         app.open(which);
     }
+}
+
+/// What a board in maskrom can be given: a loader, uploaded into its SRAM.
+///
+/// It is drawn where the verbs are drawn for an open board, because it is what
+/// can be done with this one. The container and the raw stages are the same
+/// upload in two forms. The container is one file and names its own sections,
+/// so it is one button. The raw stages are two files, so they are a form, shut
+/// until asked for.
+fn maskrom_panel(app: &mut App, ui: &mut egui::Ui) {
+    let free = app.session.job.is_none() && !app.is_bootstrapping();
+    ui.group(|ui| {
+        heading(ui, "Bring it to loader mode", Level::Part);
+        prose(
+            ui,
+            "Upload a loader into SRAM to bring this board from maskrom to loader mode, and \
+             every verb can then drive it. Upload loader takes an rkbin container \
+             (_loader.bin), which names its own sections.",
+        );
+        if ui
+            .add_enabled(free, egui::Button::new("Upload loader..."))
+            .explain_disabled("Unavailable while a job or an upload runs.")
+            .clicked()
+        {
+            app.upload_loader();
+        }
+
+        // **The other form of the same upload**, and the one the RAM-boot path is
+        // built on: mainline U-Boot's binman emits bare 471 and 472 blobs with no
+        // container around them, which the picker above parses and refuses.
+        ui.add_space(6.0);
+        ui.separator();
+        if disclosure(
+            ui,
+            "Raw stages (no container)",
+            app.maskrom.show,
+            Level::Part,
+        )
+        .explain(
+            "Upload bare usb471/usb472 stage files instead of a container. Mainline U-Boot \
+                 builds these, and they load a full U-Boot into DRAM over USB.",
+        )
+        .clicked()
+        {
+            app.maskrom.show = !app.maskrom.show;
+        }
+        if app.maskrom.show {
+            maskrom_stage_form(app, ui);
+        }
+    });
+}
+
+/// What a board in an Ingenic boot ROM can be given: the two stages that bring
+/// it to DFU.
+///
+/// It is drawn where the verbs are drawn for an open board, and it starts open,
+/// because uploading the stages is the only thing a boot ROM can do.
+fn ingenic_panel(app: &mut App, ui: &mut egui::Ui) {
+    ui.group(|ui| {
+        if disclosure(ui, "Bootstrap to DFU", app.ingenic.show, Level::Part)
+            .explain(
+                "Upload a DRAM-init SPL and a DFU-capable U-Boot to bring this board from its \
+                 boot ROM to DFU mode. Its flash is then reachable as named alt-settings.",
+            )
+            .clicked()
+        {
+            app.ingenic.show = !app.ingenic.show;
+        }
+        if app.ingenic.show {
+            ingenic_bootstrap_form(app, ui);
+        }
+    });
 }
 
 /// The verbs, and which of them this board can perform.
@@ -1891,7 +2164,7 @@ fn verbs_panel(app: &mut App, ui: &mut egui::Ui) {
             .as_ref()
             .is_some_and(|caps| caps.can_erase);
 
-        section_label(ui, "Read");
+        heading(ui, "Read", Level::Part);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(idle, egui::Button::new("Flash info"))
@@ -1899,8 +2172,12 @@ fn verbs_panel(app: &mut App, ui: &mut egui::Ui) {
             {
                 app.run(Task::Info, now);
             }
+            // Named for the CLI verb it is, `partitions`. "Partition table" is the
+            // section below that repairs and authors one, and two buttons with one
+            // name are two different acts a screen reader cannot tell apart.
             if ui
-                .add_enabled(idle, egui::Button::new("Partition table"))
+                .add_enabled(idle, egui::Button::new("Partitions"))
+                .explain("Read the device's partition table, and list it under the device.")
                 .clicked()
             {
                 app.run(Task::Partitions, now);
@@ -1951,23 +2228,76 @@ fn verbs_panel(app: &mut App, ui: &mut egui::Ui) {
             {
                 app.run(Task::StorageMedium, now);
             }
-            // Reset is a *mode*, not one act: the subcode chooses whether the
-            // board comes back, comes back as something the host operating system
-            // owns, or does not come back at all. So the button says which ending
-            // it will ask for rather than saying "Reboot" and doing one of four
-            // things, and the choice sits beside it rather than inside it -- a
-            // person should not have to open a menu to find out that this one
-            // powers the board off.
-            let mode = app.form.reset_mode;
-            if ui
-                .add_enabled(vendor, egui::Button::new(mode.describe()))
-                .explain_disabled(VENDOR_VERB_ON_A_DISK)
-                .clicked()
-            {
-                app.run(Task::Reset { mode }, now);
-            }
-            ui.add_enabled_ui(vendor, |ui| {
-                egui::ComboBox::from_label("Mode")
+        });
+
+        // **The capability refusals, on the screen rather than behind a hover.** A
+        // tooltip needs a pointer, so a keyboard user never reads one and a screen
+        // reader is told only that the button is disabled -- which is the grayed
+        // button teaching nothing, the thing this panel exists not to do. They are
+        // permanent facts about the device in the slot, not prompts about the
+        // state of the form, so they are drawn while they hold and vanish when they
+        // stop holding.
+        if target_is_disk {
+            ui.add_space(4.0);
+            guard(
+                ui,
+                format!(
+                    "Chip version, capability, storage medium and reset are refused. \
+                     {VENDOR_VERB_ON_A_DISK}"
+                ),
+            );
+        }
+
+        // The form the acts below share: where they are aimed, the image, and what
+        // guards a write. They are the acts' inputs, so they sit under the acts'
+        // heading, in one column.
+        ui.add_space(6.0);
+        ui.separator();
+        heading(ui, "Act", Level::Part);
+        let column = Column::fit(
+            ui,
+            &[
+                "Aim",
+                "Partition",
+                "LBA",
+                "Sectors",
+                "Image",
+                "SoC",
+                "Guarded by",
+            ],
+        );
+        aim(app, ui, column);
+        image_row(app, ui, column);
+        actions(app, ui, column, idle, now);
+
+        ui.add_space(6.0);
+        ui.separator();
+        device_controls(app, ui, idle && !target_is_disk, can_erase, now);
+
+        ui.add_space(6.0);
+        table_tools(app, ui, idle, now);
+        firmware_tools(app, ui, idle, now);
+    });
+}
+
+/// What ends a session with the board, rather than reading or writing it: a reset,
+/// and the erase no backend can yet be trusted with.
+fn device_controls(app: &mut App, ui: &mut egui::Ui, vendor: bool, can_erase: bool, now: f64) {
+    heading(ui, "Device", Level::Part);
+    let column = Column::fit(ui, &["Reset mode"]);
+
+    // Reset is a *mode*, not one act: the subcode chooses whether the board comes
+    // back, comes back as something the host operating system owns, or does not
+    // come back at all. So the button says which ending it will ask for rather
+    // than saying "Reboot" and doing one of four things, and the choice sits
+    // beside it rather than inside it -- a person should not have to open a menu
+    // to find out that this one powers the board off.
+    let mode = app.form.reset_mode;
+    let mut reset = false;
+    column.field(ui, "Reset mode", |ui| {
+        let choice = ui
+            .add_enabled_ui(vendor, |ui| {
+                egui::ComboBox::from_id_salt("reset mode")
                     .selected_text(mode.name())
                     .show_ui(ui, |ui| {
                         for candidate in ResetMode::ALL {
@@ -1977,71 +2307,56 @@ fn verbs_panel(app: &mut App, ui: &mut egui::Ui) {
                                 candidate.describe(),
                             );
                         }
-                    });
-            });
-
-            // **Drawn and disabled, and never hidden.** The button is here to be
-            // grayed out: a person who wants to erase a board finds out why it
-            // is refused, and a missing button tells them nothing. Both the whether and the why come from the cache, not the
-            // live agent, so a job holding the agent does not blank them out.
-            let erase = ui.add_enabled(can_erase, egui::Button::new("Erase"));
-            if let Some(why) = app.session.target.erase_reason {
-                erase.explain_disabled(why);
-            }
-        });
-
-        // **The two capability refusals, on the screen rather than behind a
-        // hover.** A tooltip needs a pointer, so a keyboard user never reads one
-        // and a screen reader is told only that the button is disabled -- which
-        // is the grayed button teaching nothing, the thing this panel exists not
-        // to do. Both are permanent facts about the device in the slot, not
-        // prompts about the state of the form, so they are drawn while they hold
-        // and vanish when they stop holding.
-        if target_is_disk {
-            ui.add_space(4.0);
-            guard(
-                ui,
-                format!("Chip version and reset are refused. {VENDOR_VERB_ON_A_DISK}"),
-            );
-        }
-        // The refusal names itself -- "rockusb erase:", "block erase:" -- so it is
-        // drawn as core wrote it rather than introduced again here.
-        if !can_erase && let Some(why) = app.session.target.erase_reason {
-            ui.add_space(4.0);
-            guard(ui, why);
-        }
-
-        // On the screen, not behind a hover. The three modes that are not a plain
-        // reboot end the session somewhere none of these verbs can reach, and one
-        // of them powers the board off -- a person choosing it should read what it
-        // does without having to go looking. The sentence is the mode's own, the
-        // same one the report will print afterwards, so what was promised and what
-        // is reported cannot drift.
-        if app.form.reset_mode.untried() {
-            ui.add_space(4.0);
-            ui.label(format!(
-                "{} No board has answered this mode yet. Its subcode comes from the reference \
-                 tools, which agree on it. It writes no flash.",
-                app.form.reset_mode.outcome()
-            ));
-        }
-
-        ui.add_space(6.0);
-        ui.separator();
-        aim(app, ui);
-
-        ui.add_space(6.0);
-        image_row(app, ui);
-
-        ui.add_space(6.0);
-        ui.separator();
-        section_label(ui, "Act");
-        actions(app, ui, idle, now);
-
-        ui.add_space(6.0);
-        table_tools(app, ui, idle, now);
-        firmware_tools(app, ui, idle, now);
+                    })
+                    .response
+            })
+            .inner;
+        reset = ui
+            .add_enabled(vendor, egui::Button::new(mode.describe()))
+            .explain_disabled(VENDOR_VERB_ON_A_DISK)
+            .clicked();
+        choice
     });
+    if reset {
+        app.run(Task::Reset { mode }, now);
+    }
+
+    // On the screen, not behind a hover. The three modes that are not a plain
+    // reboot end the session somewhere none of these verbs can reach, and one
+    // of them powers the board off -- a person choosing it should read what it
+    // does without having to go looking. The sentence is the mode's own, the
+    // same one the report will print afterwards, so what was promised and what
+    // is reported cannot drift.
+    if app.form.reset_mode.untried() {
+        column.under(ui, |ui| {
+            prose(
+                ui,
+                format!(
+                    "{} No board has answered this mode yet. Its subcode comes from the \
+                     reference tools, which agree on it. It writes no flash.",
+                    app.form.reset_mode.outcome()
+                ),
+            );
+        });
+    }
+
+    // **Drawn and disabled, and never hidden.** The button is here to be grayed
+    // out: a person who wants to erase a board finds out why it is refused, and a
+    // missing button tells them nothing. Both the whether and the why come from
+    // the cache, not the live agent, so a job holding the agent does not blank
+    // them out.
+    ui.add_space(4.0);
+    column.under(ui, |ui| {
+        let erase = ui.add_enabled(can_erase, egui::Button::new("Erase"));
+        if let Some(why) = app.session.target.erase_reason {
+            erase.explain_disabled(why);
+        }
+    });
+    // The refusal names itself -- "rockusb erase:", "block erase:" -- so it is
+    // drawn as core wrote it rather than introduced again here.
+    if !can_erase && let Some(why) = app.session.target.erase_reason {
+        column.under(ui, |ui| guard(ui, why));
+    }
 }
 
 /// Where a verb is aimed: a name the device gave, or a number a person worked out.
@@ -2050,7 +2365,7 @@ fn verbs_panel(app: &mut App, ui: &mut egui::Ui) {
 /// as a preference. A name is resolved against the device's own table, which
 /// knows where the partition ends. A name is therefore the only one of the two
 /// that can refuse an image too big to fit.
-fn aim(app: &mut App, ui: &mut egui::Ui) {
+fn aim(app: &mut App, ui: &mut egui::Ui, column: Column) {
     // A board that reaches its flash only by named region -- a DFU board, addressed
     // by alt-setting rather than a device-wide LBA -- cannot be aimed by a raw LBA,
     // so that form is disabled and the aim stays by-partition. Unknown caps (no
@@ -2065,7 +2380,7 @@ fn aim(app: &mut App, ui: &mut egui::Ui) {
         app.form.by_name = true;
     }
 
-    ui.horizontal(|ui| {
+    column.row(ui, "Aim", |ui| {
         ui.radio_value(&mut app.form.by_name, true, "By partition")
             .explain(
                 "Resolved against the device's own partition table. On a write, only this form \
@@ -2089,11 +2404,13 @@ fn aim(app: &mut App, ui: &mut egui::Ui) {
     // device rather than a state of the form, so it is a sentence and not a
     // tooltip on a radio nothing can focus.
     if !raw_lba {
-        guard(
-            ui,
-            "This board reaches its flash by named region (its DFU alt-settings), not a \
-             device-wide LBA, so it can only be aimed by partition.",
-        );
+        column.under(ui, |ui| {
+            guard(
+                ui,
+                "This board reaches its flash by named region (its DFU alt-settings), not a \
+                 device-wide LBA, so it can only be aimed by partition.",
+            );
+        });
     }
 
     if app.form.by_name {
@@ -2106,7 +2423,9 @@ fn aim(app: &mut App, ui: &mut egui::Ui) {
             .unwrap_or_default();
 
         if names.is_empty() {
-            ui.weak("Read the partition table first, and the partitions appear here.");
+            column.row(ui, "Partition", |ui| {
+                ui.weak("Read the partition table first, and the partitions appear here.")
+            });
             return;
         }
 
@@ -2115,29 +2434,31 @@ fn aim(app: &mut App, ui: &mut egui::Ui) {
         } else {
             app.form.partition.clone()
         };
-        egui::ComboBox::from_label("Partition")
-            .selected_text(selected)
-            .show_ui(ui, |ui| {
-                for name in names {
-                    ui.selectable_value(&mut app.form.partition, name.clone(), name);
-                }
-            });
+        column.field(ui, "Partition", |ui| {
+            egui::ComboBox::from_id_salt("partition")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for name in names {
+                        ui.selectable_value(&mut app.form.partition, name.clone(), name);
+                    }
+                })
+                .response
+        });
         return;
     }
 
-    ui.horizontal(|ui| {
-        named_field(ui, "LBA", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.form.lba).desired_width(120.0))
-        });
-        named_field(ui, "Sectors", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.form.sectors).desired_width(120.0))
+    column.field(ui, "LBA", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut app.form.lba).desired_width(SHORT_WIDTH))
+    });
+    column
+        .field(ui, "Sectors", |ui| {
+            ui.add(egui::TextEdit::singleline(&mut app.form.sectors).desired_width(SHORT_WIDTH))
         })
         .explain("How many sectors a dump reads. A write takes its length from the image.");
-    });
 }
 
 /// The image a write writes, and a verify compares against.
-fn image_row(app: &mut App, ui: &mut egui::Ui) {
+fn image_row(app: &mut App, ui: &mut egui::Ui, column: Column) {
     let chosen = app
         .session
         .image
@@ -2146,6 +2467,7 @@ fn image_row(app: &mut App, ui: &mut egui::Ui) {
 
     let pressed = file_row(
         ui,
+        column,
         "Image",
         "an image file",
         chosen,
@@ -2169,7 +2491,7 @@ const VENDOR_VERB_ON_A_DISK: &str = "A vendor protocol command needs a board to 
      operating system owns. There is no loader on it to ask.";
 
 /// The buttons that read a board, and the ones that overwrite one.
-fn actions(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
+fn actions(app: &mut App, ui: &mut egui::Ui, column: Column, idle: bool, now: f64) {
     let aimed = app.aim();
     let image_bytes = app.session.image.as_ref().map(|image| image.bytes);
 
@@ -2183,25 +2505,28 @@ fn actions(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     // to ask. What stands in its place is not nothing -- it is the guard that is
     // actually there, said in the same spot a person is used to reading a guard.
     if app.target_is_disk() {
-        ui.horizontal(|ui| {
-            ui.label("Guarded by");
-            ui.weak(
-                "an exclusive open, on a disk that does not hold the running system. A disk runs \
-                 no loader, so no SoC is asked for.",
-            )
-            .explain(
-                "A disk runs no loader, so the wrong-loader gate does not apply. Two checks \
-                     guard a write to a disk instead. The kernel holds the disk for pyrographer \
-                     alone (O_EXCL), and no disk that holds the running system can be opened. \
-                     Both are checked when the disk is opened.",
-            );
+        column.row(ui, "Guarded by", |ui| {
+            ui.vertical(|ui| {
+                measured(ui, |ui| {
+                    ui.weak(
+                        "An exclusive open, on a disk that does not hold the running system. A \
+                         disk runs no loader, so no SoC is asked for.",
+                    )
+                    .explain(
+                        "A disk runs no loader, so the wrong-loader gate does not apply. Two \
+                         checks guard a write to a disk instead. The kernel holds the disk for \
+                         pyrographer alone (O_EXCL), and no disk that holds the running system \
+                         can be opened. Both are checked when the disk is opened.",
+                    );
+                });
+            });
         });
     } else {
-        ui.horizontal(|ui| {
-            named_field(ui, "SoC", |ui| {
+        column
+            .field(ui, "SoC", |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut app.form.soc)
-                        .desired_width(80.0)
+                        .desired_width(SHORT_WIDTH)
                         .hint_text("rk3576"),
                 )
             })
@@ -2210,7 +2535,6 @@ fn actions(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
                  reply pinned for this SoC, byte for byte. If this field is empty, a write is \
                  planned but refused.",
             );
-        });
     }
     ui.add_space(4.0);
 
@@ -2240,86 +2564,90 @@ fn actions(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
         None
     };
 
-    ui.horizontal_wrapped(|ui| {
-        // A dump needs somewhere to go, and asking for it is asking for the
-        // dump: the file dialog is the last thing between the button and the
-        // read.
-        let can_dump = idle && !app.is_picking() && dump_range(app).is_some();
-        let dump = ui
-            .add_enabled(can_dump, egui::Button::new("Dump to file..."))
-            .explain_disabled("Choose a partition, or enter an LBA and a sector count.");
-        if dump.clicked()
-            && let Some((lba, sectors)) = dump_range(app)
-        {
-            app.dump(lba, sectors, suggested_name(app));
-        }
-
-        let can_verify = idle && aimed.is_some() && image_bytes.is_some();
-        let verify = ui
-            .add_enabled(can_verify, egui::Button::new("Verify against image"))
-            .explain_disabled(
-                "Choose a partition or enter an LBA, then choose an image to compare the flash \
-                 against.",
-            );
-        if verify.clicked() {
-            start_verify(app, now);
-        }
-
-        // The write. It is a plan first, always -- the plan is the dry run and
-        // there is no other one, because a dry run that took a different path
-        // would be a rehearsal for a different show.
-        let can_plan = idle && aimed.is_some() && image_bytes.is_some();
-        let plan = ui
-            .add_enabled(can_plan, egui::Button::new("Plan a write..."))
-            .explain_disabled("Choose a partition or enter an LBA, then choose an image to write.");
-        if plan.clicked()
-            && let (Some(aim), Some(image_bytes)) = (aimed.clone(), image_bytes)
-        {
-            // The plan reads the image's first bytes, to refuse a container written
-            // raw before the board is asked anything. The write opens it again.
-            let reader = app.session.image.as_ref().map(|image| image.reader());
-            match reader {
-                Some(Ok(image)) => {
-                    let soc = app.planned_soc();
-                    app.run(
-                        Task::PlanWrite {
-                            aim,
-                            image_bytes,
-                            image,
-                            soc,
-                        },
-                        now,
-                    );
-                }
-                Some(Err(error)) => app.session.last = Some(Err(error)),
-                None => {}
+    column.under(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            // A dump needs somewhere to go, and asking for it is asking for the
+            // dump: the file dialog is the last thing between the button and the
+            // read.
+            let can_dump = idle && !app.is_picking() && dump_range(app).is_some();
+            let dump = ui
+                .add_enabled(can_dump, egui::Button::new("Dump to file..."))
+                .explain_disabled("Choose a partition, or enter an LBA and a sector count.");
+            if dump.clicked()
+                && let Some((lba, sectors)) = dump_range(app)
+            {
+                app.dump(lba, sectors, suggested_name(app));
             }
-        }
 
-        // A clone names both boards and infers neither, because the difference
-        // between the two is which one gets destroyed. A clone also spans a whole
-        // device by raw LBA at both ends, so a board that reaches its flash only by
-        // named region (a DFU board) can be neither copied nor cloned onto.
-        let can_clone = idle && app.session.source.connection.is_idle() && clone_refusal.is_none();
-        let clone_hover = clone_refusal.unwrap_or(
+            let can_verify = idle && aimed.is_some() && image_bytes.is_some();
+            let verify = ui
+                .add_enabled(can_verify, egui::Button::new("Verify against image"))
+                .explain_disabled(
+                    "Choose a partition or enter an LBA, then choose an image to compare the flash \
+                 against.",
+                );
+            if verify.clicked() {
+                start_verify(app, now);
+            }
+
+            // The write. It is a plan first, always -- the plan is the dry run and
+            // there is no other one, because a dry run that took a different path
+            // would be a rehearsal for a different show.
+            let can_plan = idle && aimed.is_some() && image_bytes.is_some();
+            let plan = ui
+                .add_enabled(can_plan, egui::Button::new("Plan a write..."))
+                .explain_disabled(
+                    "Choose a partition or enter an LBA, then choose an image to write.",
+                );
+            if plan.clicked()
+                && let (Some(aim), Some(image_bytes)) = (aimed.clone(), image_bytes)
+            {
+                // The plan reads the image's first bytes, to refuse a container written
+                // raw before the board is asked anything. The write opens it again.
+                let reader = app.session.image.as_ref().map(|image| image.reader());
+                match reader {
+                    Some(Ok(image)) => {
+                        let soc = app.planned_soc();
+                        app.run(
+                            Task::PlanWrite {
+                                aim,
+                                image_bytes,
+                                image,
+                                soc,
+                            },
+                            now,
+                        );
+                    }
+                    Some(Err(error)) => app.session.last = Some(Err(error)),
+                    None => {}
+                }
+            }
+
+            // A clone names both boards and infers neither, because the difference
+            // between the two is which one gets destroyed. A clone also spans a whole
+            // device by raw LBA at both ends, so a board that reaches its flash only by
+            // named region (a DFU board) can be neither copied nor cloned onto.
+            let can_clone =
+                idle && app.session.source.connection.is_idle() && clone_refusal.is_none();
+            let clone_hover = clone_refusal.unwrap_or(
             "A clone needs both boards open: the one it copies, and the one it overwrites. Neither \
              is inferred.",
         );
-        let clone = ui
-            .add_enabled(can_clone, egui::Button::new("Plan a clone..."))
-            .explain_disabled(clone_hover);
-        if clone.clicked() {
-            let soc = app.planned_soc();
-            app.run(Task::PlanClone { soc }, now);
-        }
+            let clone = ui
+                .add_enabled(can_clone, egui::Button::new("Plan a clone..."))
+                .explain_disabled(clone_hover);
+            if clone.clicked() {
+                let soc = app.planned_soc();
+                app.run(Task::PlanClone { soc }, now);
+            }
+        });
     });
 
     // A clone these boards cannot take part in at all, as against a clone that is
     // merely not set up yet: the first is a capability and is drawn, the second is
     // form state and stays on the grayed button.
     if let Some(why) = clone_refusal {
-        ui.add_space(4.0);
-        guard(ui, format!("A clone is refused. {why}"));
+        column.under(ui, |ui| guard(ui, format!("A clone is refused. {why}")));
     }
 
     // Said here, before anybody plans anything, and not sprung on them at the
@@ -2327,21 +2655,27 @@ fn actions(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     // is the dry run, and it carries the gate's verdict either way.
     match app.gate_soc() {
         Err(error) => {
-            ui.add_space(4.0);
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                "The SoC on the form is not one the gate knows.",
-            );
-            ui.weak(format!("{error}"));
+            column.under(ui, |ui| {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    "The SoC on the form is not one the gate knows.",
+                );
+                measured(ui, |ui| {
+                    ui.weak(format!("{error}"));
+                });
+            });
         }
         Ok(soc) => {
             if let Some(why) = app.session.target.write_refusal(soc) {
-                ui.add_space(4.0);
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "Writes are refused on this board.",
-                );
-                ui.weak(why);
+                column.under(ui, |ui| {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Writes are refused on this board.",
+                    );
+                    measured(ui, |ui| {
+                        ui.weak(why);
+                    });
+                });
             }
         }
     }
@@ -2365,26 +2699,23 @@ fn table_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     // damaged table and authoring a fresh one are what somebody comes here for on
     // a board that is already wrong; they are not part of reading or writing one
     // that is fine, and open they pushed the buttons somebody did come for off the
-    // screen. The arrow and the words are the whole control, the way the Disks
-    // section's are, so what an assistive technology is told is what is drawn.
-    ui.horizontal(|ui| {
-        let arrow = if app.show_table_tools { "v" } else { ">" };
-        if ui
-            .button(format!("{arrow}  Partition table"))
-            .explain(
-                "Repair a damaged partition table from an intact copy, or author a fresh one. \
-                 Both are gated writes that end at a plan screen. Nothing here writes without \
-                 your confirmation.",
-            )
-            .clicked()
-        {
-            app.show_table_tools = !app.show_table_tools;
-        }
-    });
+    // screen. The toggle is a `disclosure`, as the Disks section's is, so its state
+    // is published rather than spelled into its name.
+    if disclosure(ui, "Partition table", app.show_table_tools, Level::Part)
+        .explain(
+            "Repair a damaged partition table from an intact copy, or author a fresh one. Both \
+             are gated writes that end at a plan screen. Nothing here writes without your \
+             confirmation.",
+        )
+        .clicked()
+    {
+        app.show_table_tools = !app.show_table_tools;
+    }
     if !app.show_table_tools {
         return;
     }
     ui.add_space(4.0);
+    let column = Column::fit(ui, &TABLE_TOOLS_LABELS);
 
     // **On the screen, not behind a hover**, for the reason the capability
     // refusals in the verb panel are: it is a permanent fact about the device in
@@ -2404,9 +2735,7 @@ fn table_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     // answer is what tells them apart. Two buttons, not one that routes by the table
     // already read, because the case a repair is for is the table too damaged to name
     // its own format.
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Repair");
-
+    column.row(ui, "Repair", |ui| {
         let gpt = ui
             .add_enabled(can_table, egui::Button::new("Repair GPT..."))
             .explain_disabled(disabled_why.clone())
@@ -2435,8 +2764,11 @@ fn table_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     });
 
     ui.add_space(4.0);
-    author_tools(app, ui, idle, now);
+    author_tools(app, ui, column, idle, now);
 }
+
+/// Every label the partition table section can draw, the authoring form's included.
+const TABLE_TOOLS_LABELS: [&str; 5] = ["Repair", "Format", "From", "File", "Medium"];
 
 /// What a grayed table tool says when the device is open but cannot take a command.
 ///
@@ -2469,20 +2801,16 @@ fn table_refusal(app: &App) -> Option<String> {
 /// and the section grays on the same answer, cached at open.
 fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     ui.separator();
-    ui.horizontal(|ui| {
-        let arrow = if app.show_firmware_tools { "v" } else { ">" };
-        if ui
-            .button(format!("{arrow}  Firmware"))
-            .explain(
-                "Write a Rockchip firmware package (update.img) whole, or a loader's ID block \
-                 alone. Both are gated writes that end at a plan screen. Nothing here writes \
-                 without your confirmation.",
-            )
-            .clicked()
-        {
-            app.show_firmware_tools = !app.show_firmware_tools;
-        }
-    });
+    if disclosure(ui, "Firmware", app.show_firmware_tools, Level::Part)
+        .explain(
+            "Write a Rockchip firmware package (update.img) whole, or a loader's ID block alone. \
+             Both are gated writes that end at a plan screen. Nothing here writes without your \
+             confirmation.",
+        )
+        .clicked()
+    {
+        app.show_firmware_tools = !app.show_firmware_tools;
+    }
     if !app.show_firmware_tools {
         return;
     }
@@ -2496,6 +2824,7 @@ fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     let can_plan = idle && refused.is_none();
     let busy_why = refused.unwrap_or_else(|| TABLE_TOOLS_BUSY.to_string());
     let picking = app.is_picking();
+    let column = Column::fit(ui, &["Package", "Loader"]);
 
     prose(
         ui,
@@ -2511,6 +2840,7 @@ fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     let has_package = chosen.is_some();
     let pressed = file_row(
         ui,
+        column,
         "Package",
         "a firmware package",
         chosen,
@@ -2523,8 +2853,8 @@ fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     if pressed.forget {
         app.forget_firmware_file(FirmwareFileKind::Package);
     }
-    let plan = ui
-        .add_enabled(
+    let plan = column.under(ui, |ui| {
+        ui.add_enabled(
             can_plan && has_package && !picking,
             egui::Button::new("Plan firmware write..."),
         )
@@ -2538,7 +2868,8 @@ fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
         .explain(
             "Read and check the whole package, then show every run the write lays down. Nothing \
              is written until you confirm the plan.",
-        );
+        )
+    });
     if plan.clicked() {
         app.plan_firmware(now);
     }
@@ -2558,6 +2889,7 @@ fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     let has_loader = chosen.is_some();
     let pressed = file_row(
         ui,
+        column,
         "Loader",
         "a loader for the ID block",
         chosen,
@@ -2570,8 +2902,8 @@ fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
     if pressed.forget {
         app.forget_firmware_file(FirmwareFileKind::Loader);
     }
-    let id_block = ui
-        .add_enabled(
+    let id_block = column.under(ui, |ui| {
+        ui.add_enabled(
             can_plan && has_loader && !picking,
             egui::Button::new("Plan ID block write..."),
         )
@@ -2585,7 +2917,8 @@ fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
         .explain(
             "Build the ID block from the loader, check every hash its header records, and show \
              where it lands. The partition table is left as it is.",
-        );
+        )
+    });
     if id_block.clicked() {
         app.plan_id_block(now);
     }
@@ -2627,9 +2960,9 @@ fn firmware_refusal_reason(app: &App) -> Option<String> {
 
 /// The "Author a fresh table" form: config-heavy, so revealed on demand.
 ///
-/// It is a single button until a person asks for it, the same "declared, not
-/// dumped" shape the serial recovery form uses. Once open, it is a small form with
-/// these fields:
+/// It is shut until a person asks for it, the same "declared, not dumped" shape
+/// the serial recovery form uses. Once open, it is a small form with these
+/// fields, in the partition table section's column:
 ///
 /// - The format
 /// - Where the layout comes from
@@ -2638,140 +2971,122 @@ fn firmware_refusal_reason(app: &App) -> Option<String> {
 ///
 /// Authoring is a gated write like any other, so it ends at the same plan screen
 /// the writes and repairs do. Nothing here writes.
-fn author_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
+fn author_tools(app: &mut App, ui: &mut egui::Ui, column: Column, idle: bool, now: f64) {
     let refused = table_refusal(app);
     let can_table = idle && refused.is_none();
+    if disclosure(ui, "Author a fresh table", app.author.show, Level::Part)
+        .explain("Write a fresh partition table from a layout file.")
+        .clicked()
+    {
+        app.author.show = !app.author.show;
+    }
     if !app.author.show {
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(can_table, egui::Button::new("Author a fresh table..."))
-                .explain_disabled(refused.unwrap_or_else(|| TABLE_TOOLS_BUSY.to_string()))
-                .clicked()
-            {
-                app.author.show = true;
-            }
-        });
         return;
     }
 
-    ui.group(|ui| {
-        ui.horizontal(|ui| {
-            section_label(ui, "Author a fresh table");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("Hide")
-                    .named("Hide the table authoring form")
-                    .clicked()
-                {
-                    app.author.show = false;
-                }
-            });
-        });
-        prose(
-            ui,
-            "Write a fresh table from a partition layout. This overwrites the table. It is \
-             planned and gated like any write, and read back window by window.",
+    prose(
+        ui,
+        "Write a fresh table from a partition layout. This overwrites the table. It is planned \
+         and gated like any write, and read back window by window.",
+    );
+
+    column.row(ui, "Format", |ui| {
+        ui.radio_value(&mut app.author.format, TableFormat::Gpt, "GPT");
+        ui.radio_value(
+            &mut app.author.format,
+            TableFormat::RockchipParam,
+            "Rockchip parameter",
         );
+    });
 
-        ui.horizontal(|ui| {
-            ui.label("Format");
-            ui.radio_value(&mut app.author.format, TableFormat::Gpt, "GPT");
-            ui.radio_value(
-                &mut app.author.format,
-                TableFormat::RockchipParam,
-                "Rockchip parameter",
-            );
-        });
+    // A GPT is not built from parameter text, so if the format is switched to
+    // GPT while the verbatim-text source was chosen, fall back to a layout file.
+    if app.author.format == TableFormat::Gpt && app.author.source == AuthorSourceKind::Text {
+        app.author.source = AuthorSourceKind::Native;
+    }
 
-        // A GPT is not built from parameter text, so if the format is switched to
-        // GPT while the verbatim-text source was chosen, fall back to a layout file.
-        if app.author.format == TableFormat::Gpt && app.author.source == AuthorSourceKind::Text {
-            app.author.source = AuthorSourceKind::Native;
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("From");
+    column.row(ui, "From", |ui| {
+        ui.radio_value(
+            &mut app.author.source,
+            AuthorSourceKind::Native,
+            "native layout",
+        )
+        .explain(
+            "A native-format layout: name, first LBA, sectors, and an optional type and uuid= \
+             per line.",
+        );
+        ui.radio_value(
+            &mut app.author.source,
+            AuthorSourceKind::Mtdparts,
+            "mtdparts line",
+        )
+        .explain("A file holding a board's own mtdparts= line.");
+        if app.author.format == TableFormat::RockchipParam {
             ui.radio_value(
                 &mut app.author.source,
-                AuthorSourceKind::Native,
-                "native layout",
+                AuthorSourceKind::Text,
+                "parameter text",
             )
             .explain(
-                "A native-format layout: name, first LBA, sectors, and an optional type and \
-                     uuid= per line.",
+                "An existing parameter block's whole text, framed verbatim, so FIRMWARE_VER and \
+                 every other key are kept.",
             );
-            ui.radio_value(
-                &mut app.author.source,
-                AuthorSourceKind::Mtdparts,
-                "mtdparts line",
-            )
-            .explain("A file holding a board's own mtdparts= line.");
-            if app.author.format == TableFormat::RockchipParam {
-                ui.radio_value(
-                    &mut app.author.source,
-                    AuthorSourceKind::Text,
-                    "parameter text",
-                )
+        }
+    });
+
+    let chosen = app
+        .author
+        .file
+        .as_ref()
+        .map(|file| (file.name.clone(), file.bytes.len() as u64));
+    let pressed = file_row(
+        ui,
+        column,
+        "File",
+        "a partition layout file",
+        chosen,
+        app.is_picking(),
+        "none chosen",
+    );
+    if pressed.choose {
+        app.pick_layout_file();
+    }
+    if pressed.forget {
+        app.author.file = None;
+    }
+
+    // The medium is a parameter fact: it decides where the copies go, and what an
+    // mtdparts layout's offsets count from. A GPT is absolute and takes none.
+    if app.author.format == TableFormat::RockchipParam {
+        column.row(ui, "Medium", |ui| {
+            ui.radio_value(&mut app.author.medium, ParamMedium::Emmc, "eMMC")
                 .explain(
-                    "An existing parameter block's whole text, framed verbatim, so \
-                         FIRMWARE_VER and every other key are kept.",
+                    "One parameter copy, at sector 0x2000. A layout's offsets count from that \
+                     sector.",
                 );
-            }
+            ui.radio_value(&mut app.author.medium, ParamMedium::Nand, "raw NAND")
+                .explain(
+                    "Several copies, written from sector 0. A layout's offsets count from sector \
+                     0.",
+                );
         });
+    }
 
-        let chosen = app
-            .author
-            .file
-            .as_ref()
-            .map(|file| (file.name.clone(), file.bytes.len() as u64));
-        let pressed = file_row(
-            ui,
-            "File",
-            "a partition layout file",
-            chosen,
-            app.is_picking(),
-            "none chosen",
-        );
-        if pressed.choose {
-            app.pick_layout_file();
-        }
-        if pressed.forget {
-            app.author.file = None;
-        }
-
-        // The medium is a parameter fact: it decides where the copies go, and what an
-        // mtdparts layout's offsets count from. A GPT is absolute and takes none.
-        if app.author.format == TableFormat::RockchipParam {
-            ui.horizontal(|ui| {
-                ui.label("Medium");
-                ui.radio_value(&mut app.author.medium, ParamMedium::Emmc, "eMMC")
-                    .explain(
-                        "One parameter copy, at sector 0x2000. A layout's offsets count from that \
-                         sector.",
-                    );
-                ui.radio_value(&mut app.author.medium, ParamMedium::Nand, "raw NAND")
-                    .explain(
-                        "Several copies, written from sector 0. A layout's offsets count from \
-                         sector 0.",
-                    );
-            });
-        }
-
-        ui.add_space(4.0);
-        let can_author = can_table && app.author.file.is_some() && !app.is_picking();
-        let plan = ui
-            .add_enabled(can_author, egui::Button::new("Author table..."))
+    ui.add_space(4.0);
+    let can_author = can_table && app.author.file.is_some() && !app.is_picking();
+    let plan = column.under(ui, |ui| {
+        ui.add_enabled(can_author, egui::Button::new("Author table..."))
             .explain_disabled(match refused {
                 Some(why) => why,
                 None if !idle => TABLE_TOOLS_BUSY.to_string(),
                 None => "Choose a layout file. Authoring writes flash and is gated like any \
                          write, so on a board, name the SoC above."
                     .to_string(),
-            });
-        if plan.clicked() {
-            app.plan_author(now);
-        }
+            })
     });
+    if plan.clicked() {
+        app.plan_author(now);
+    }
 }
 
 /// The range a dump reads: the partition's own extent, or the numbers on the
@@ -3028,8 +3343,6 @@ fn chip_claim(chip: Option<&[u8]>) -> Vec<String> {
 /// `verbs::loader_blob_refusal` passes anything it cannot judge. The running panel
 /// repeats the statement, because silence there would read as a check that passed.
 fn maskrom_stage_form(app: &mut App, ui: &mut egui::Ui) {
-    ui.separator();
-    section_label(ui, "Raw stages (no container)");
     prose(
         ui,
         "Upload the bare usb471/usb472 files that mainline U-Boot's binman emits, instead of an \
@@ -3038,32 +3351,56 @@ fn maskrom_stage_form(app: &mut App, ui: &mut egui::Ui) {
          The board then answers on its serial port rather than on the bus.",
     );
 
-    maskrom_stage_row(app, ui, MaskromStageKind::Code471, "471 (DRAM init)");
-    maskrom_stage_row(app, ui, MaskromStageKind::Code472, "472 (loader)");
-
-    guard(
+    let column = Column::fit(ui, &["Stage 471", "Stage 472"]);
+    maskrom_stage_row(
+        app,
         ui,
-        "These files carry no container and so name no SoC. Nothing checks which board they are \
-         for. The SoC gate has nothing to compare, and a maskrom board neither reports a chip \
-         version nor can be read back.",
+        column,
+        MaskromStageKind::Code471,
+        "Stage 471",
+        "optional: DRAM init",
     );
+    maskrom_stage_row(
+        app,
+        ui,
+        column,
+        MaskromStageKind::Code472,
+        "Stage 472",
+        "optional: loader",
+    );
+
+    column.under(ui, |ui| {
+        guard(
+            ui,
+            "These files carry no container and so name no SoC. Nothing checks which board they \
+             are for. The SoC gate has nothing to compare, and a maskrom board neither reports a \
+             chip version nor can be read back.",
+        );
+    });
 
     let has_stage = app.maskrom.code_471.is_some() || app.maskrom.code_472.is_some();
     let can_upload = has_stage && !app.is_bootstrapping() && app.session.job.is_none();
 
     ui.add_space(4.0);
-    if ui
-        .add_enabled(can_upload, egui::Button::new("Upload the stages..."))
-        .explain_disabled("Choose at least one stage file: a 471, a 472, or both.")
-        .clicked()
-    {
+    let upload = column.under(ui, |ui| {
+        ui.add_enabled(can_upload, egui::Button::new("Upload the stages..."))
+            .explain_disabled("Choose at least one stage file: a 471, a 472, or both.")
+    });
+    if upload.clicked() {
         app.upload_raw_stages();
     }
 }
 
 /// One of the two raw maskrom stages: what it is, whether it is chosen, and the
 /// buttons to choose or forget it.
-fn maskrom_stage_row(app: &mut App, ui: &mut egui::Ui, kind: MaskromStageKind, label: &str) {
+fn maskrom_stage_row(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    column: Column,
+    kind: MaskromStageKind,
+    label: &str,
+    hint: &str,
+) {
     // Read what is chosen out first, so the buttons below can take `app` mutably.
     let chosen: Option<(String, u64)> = {
         let blob = match kind {
@@ -3075,7 +3412,7 @@ fn maskrom_stage_row(app: &mut App, ui: &mut egui::Ui, kind: MaskromStageKind, l
 
     // Neither is "required" on its own: `db` takes either or both, and the upload
     // button is what enforces that one of them is there.
-    let pressed = file_row(ui, label, label, chosen, app.is_picking(), "optional");
+    let pressed = file_row(ui, column, label, label, chosen, app.is_picking(), hint);
     if pressed.choose {
         app.pick_maskrom_stage(kind);
     }
@@ -3099,8 +3436,6 @@ fn maskrom_stage_row(app: &mut App, ui: &mut egui::Ui, kind: MaskromStageKind, l
 /// calls are pinned against a scripted transport. The load addresses are seeded with
 /// thingino-dfu's family-wide defaults and stay editable.
 fn ingenic_bootstrap_form(app: &mut App, ui: &mut egui::Ui) {
-    ui.separator();
-    section_label(ui, "Bootstrap to DFU (Ingenic boot ROM)");
     prose(
         ui,
         "This boot ROM has no flash commands. Upload a DRAM-init SPL and a DFU-capable U-Boot, \
@@ -3109,22 +3444,33 @@ fn ingenic_bootstrap_form(app: &mut App, ui: &mut egui::Ui) {
          build links its stages elsewhere. This flow is untested against a real board.",
     );
 
+    let column = Column::fit(
+        ui,
+        &[
+            "Stage 1",
+            "Stage 1 address",
+            "Stage 2",
+            "Stage 2 address",
+            "DRAM settle",
+        ],
+    );
+
     ingenic_stage_row(
         app,
         ui,
+        column,
         IngenicStageKind::Stage1,
-        "Stage1 (DRAM-init SPL)",
-        true,
+        "Stage 1",
+        "required: DRAM-init SPL",
     );
-    ui.horizontal(|ui| {
-        // Named for its stage rather than "load address" twice: two identically
-        // named fields are a coin toss read aloud, and the indent that tells them
-        // apart on the screen is not in the name.
-        named_field(ui, "    Stage1 load address", |ui| {
+    // Named for its stage rather than "load address" twice: two identically
+    // named fields are a coin toss read aloud.
+    column
+        .field(ui, "Stage 1 address", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.ingenic.stage1_addr)
                     .hint_text("0x________")
-                    .desired_width(140.0),
+                    .desired_width(SHORT_WIDTH),
             )
         })
         .explain(
@@ -3132,22 +3478,22 @@ fn ingenic_bootstrap_form(app: &mut App, ui: &mut egui::Ui) {
              family-wide spl_addr, which every XBurst SoC shares. Change it if your build links \
              the SPL elsewhere.",
         );
-    });
 
     ingenic_stage_row(
         app,
         ui,
+        column,
         IngenicStageKind::Stage2,
-        "Stage2 (DFU U-Boot)",
-        false,
+        "Stage 2",
+        "optional: DFU U-Boot",
     );
-    ui.horizontal(|ui| {
-        named_field(ui, "    Stage2 load address", |ui| {
+    column
+        .field(ui, "Stage 2 address", |ui| {
             ui.add_enabled(
                 app.ingenic.stage2.is_some(),
                 egui::TextEdit::singleline(&mut app.ingenic.stage2_addr)
                     .hint_text("0x________")
-                    .desired_width(140.0),
+                    .desired_width(SHORT_WIDTH),
             )
         })
         .explain(
@@ -3155,17 +3501,19 @@ fn ingenic_bootstrap_form(app: &mut App, ui: &mut egui::Ui) {
              family-wide uboot_addr (DRAM base + 1 MiB). Change it if your build links U-Boot \
              elsewhere.",
         );
-    });
 
-    ui.horizontal(|ui| {
-        named_field(ui, "DRAM settle (ms)", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.ingenic.settle_ms).desired_width(80.0))
+    column
+        .field(ui, "DRAM settle", |ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut app.ingenic.settle_ms).desired_width(SHORT_WIDTH),
+            );
+            ui.weak("ms");
+            field
         })
         .explain(
-            "How long to wait after stage1 for the memory controller to bring up DRAM, \
-                 before stage2 is loaded into it. The community value is around 2000 ms.",
+            "How long to wait after stage1 for the memory controller to bring up DRAM, before \
+             stage2 is loaded into it, in milliseconds. The community value is around 2000 ms.",
         );
-    });
 
     let has_stage1 = app.ingenic.stage1.is_some();
     let has_stage1_addr = !app.ingenic.stage1_addr.trim().is_empty();
@@ -3175,12 +3523,14 @@ fn ingenic_bootstrap_form(app: &mut App, ui: &mut egui::Ui) {
         && app.session.job.is_none();
 
     ui.add_space(4.0);
-    let go = ui
-        .add_enabled(can_bootstrap, egui::Button::new("Bootstrap..."))
-        .explain_disabled(
-            "Choose a stage1 SPL and enter its hex load address. A stage2 U-Boot is optional. \
-             Without it, the board only initializes DRAM and does not re-enumerate.",
-        );
+    let go = column.under(ui, |ui| {
+        ui.add_enabled(can_bootstrap, egui::Button::new("Bootstrap..."))
+            .explain_disabled(
+                "Choose a stage1 SPL and enter its hex load address. A stage2 U-Boot is \
+                 optional. Without it, the board only initializes DRAM and does not \
+                 re-enumerate.",
+            )
+    });
     if go.clicked() {
         app.bootstrap_ingenic();
     }
@@ -3191,9 +3541,10 @@ fn ingenic_bootstrap_form(app: &mut App, ui: &mut egui::Ui) {
 fn ingenic_stage_row(
     app: &mut App,
     ui: &mut egui::Ui,
+    column: Column,
     kind: IngenicStageKind,
     label: &str,
-    required: bool,
+    hint: &str,
 ) {
     // Read what is chosen out first, so the buttons below can take `app` mutably.
     let chosen: Option<(String, u64)> = {
@@ -3206,11 +3557,12 @@ fn ingenic_stage_row(
 
     let pressed = file_row(
         ui,
+        column,
         label,
         label,
         chosen,
         app.is_picking_ingenic_stage(),
-        if required { "required" } else { "optional" },
+        hint,
     );
     if pressed.choose {
         app.pick_ingenic_stage(kind);
@@ -3254,30 +3606,31 @@ fn ingenic_bootstrap_panel(
 ///
 /// Serial recovery cannot be discovered. A JH7110 in UART recovery is just a
 /// serial port, and nothing on it announces the board. No scan reveals it as one
-/// reveals a USB board, so it is declared. It is a single secondary action until a
-/// person says they have a board to recover, and only then does its form appear.
-/// Once the flow is in use it stays open, and "Hide" collapses it again while it
-/// is idle.
+/// reveals a USB board, so it is declared. The section is shut until a person
+/// opens it, and its heading is the toggle. Once the flow holds a file, a plan or
+/// a job, it stays open, and the toggle says why it cannot be shut.
 fn recovery_entry(app: &mut App, ui: &mut egui::Ui) {
-    if app.show_recovery || app.session.recovery.is_active() {
-        recovery_section(app, ui);
-        if app.show_recovery && !app.session.recovery.is_active() {
-            ui.horizontal(|ui| {
-                if ui.small_button("Hide serial recovery").clicked() {
-                    app.show_recovery = false;
-                }
-            });
-        }
-        return;
-    }
-
     ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("Recovering a StarFive JH7110?");
-        if ui.button("Start serial recovery...").clicked() {
-            app.show_recovery = true;
-        }
-    });
+    let active = app.session.recovery.is_active();
+    let open = app.show_recovery || active;
+    let toggle = ui
+        .add_enabled_ui(!active, |ui| {
+            disclosure(ui, "StarFive recovery (serial)", open, Level::Section)
+        })
+        .inner
+        .explain(
+            "Recover a StarFive JH7110 over its UART: write its QSPI NOR flash through the \
+             recovery agent, or boot U-Boot in RAM.",
+        )
+        .explain_disabled(
+            "The section stays open while it holds a chosen file, a plan or a running job.",
+        );
+    if toggle.clicked() {
+        app.show_recovery = !open;
+    }
+    if open {
+        recovery_section(app, ui);
+    }
 }
 
 /// The port row, the one place the two builds draw a serial flow differently.
@@ -3289,16 +3642,16 @@ fn recovery_entry(app: &mut App, ui: &mut egui::Ui) {
 /// Everything after this row (the target, the files, the plan and the transcript)
 /// is drawn the same in both builds.
 #[cfg(not(target_arch = "wasm32"))]
-fn port_field(app: &mut App, ui: &mut egui::Ui, which: PortField, name: &str) {
-    let (port, width) = match which {
-        PortField::Recovery => (&mut app.recover.port, 220.0),
-        PortField::Console => (&mut app.console.port, 200.0),
+fn port_field(app: &mut App, ui: &mut egui::Ui, column: Column, which: PortField, name: &str) {
+    let port = match which {
+        PortField::Recovery => &mut app.recover.port,
+        PortField::Console => &mut app.console.port,
     };
-    named_field(ui, "Port", |ui| {
+    column.field(ui, "Port", |ui| {
         ui.add(
             egui::TextEdit::singleline(port)
                 .hint_text("/dev/ttyUSB0")
-                .desired_width(width),
+                .desired_width(FIELD_WIDTH),
         )
         .named(name)
     });
@@ -3310,13 +3663,13 @@ fn port_field(app: &mut App, ui: &mut egui::Ui, which: PortField, name: &str) {
 /// button is. `requestPort` needs a fresh user gesture, and a second chooser opened
 /// over the first would answer into a slot nobody is holding.
 #[cfg(target_arch = "wasm32")]
-fn port_field(app: &mut App, ui: &mut egui::Ui, which: PortField, name: &str) {
+fn port_field(app: &mut App, ui: &mut egui::Ui, column: Column, which: PortField, name: &str) {
     let chosen = match which {
         PortField::Recovery => app.recover.port.clone(),
         PortField::Console => app.console.port.clone(),
     };
 
-    named_field(ui, "Port", |ui| {
+    column.row(ui, "Port", |ui| {
         let button = ui
             .add_enabled(
                 !app.is_choosing_port(),
@@ -3335,19 +3688,15 @@ fn port_field(app: &mut App, ui: &mut egui::Ui, which: PortField, name: &str) {
         if button.clicked() {
             app.choose_port(which);
         }
-        button
+        if chosen.is_empty() {
+            ui.weak("no port chosen");
+        } else {
+            ui.label(chosen);
+        }
     });
-
-    if chosen.is_empty() {
-        ui.weak("no port chosen");
-    } else {
-        ui.label(chosen);
-    }
 }
 
 fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
-    ui.separator();
-    section_label(ui, "StarFive recovery (serial)");
     prose(
         ui,
         "The JH7110 BootROM has no USB. Strap the board into UART recovery, connect a USB-serial \
@@ -3357,18 +3706,19 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
          flash.",
     );
 
-    ui.horizontal(|ui| {
-        port_field(
-            app,
-            ui,
-            PortField::Recovery,
-            "Port for the StarFive recovery",
-        );
-    });
+    let column = Column::fit(ui, &["Port", "Recovery agent", "SPL", "U-Boot payload"]);
+    port_field(
+        app,
+        ui,
+        column,
+        PortField::Recovery,
+        "Port for the StarFive recovery",
+    );
 
     recovery_file_row(
         app,
         ui,
+        column,
         RecoveryFileKind::Agent,
         "Recovery agent",
         "needed to write flash",
@@ -3376,13 +3726,15 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
     recovery_file_row(
         app,
         ui,
+        column,
         RecoveryFileKind::Spl,
-        "SPL (u-boot-spl.bin or .normal.out)",
-        "optional",
+        "SPL",
+        "optional: u-boot-spl.bin or .normal.out",
     );
     recovery_file_row(
         app,
         ui,
+        column,
         RecoveryFileKind::Uboot,
         "U-Boot payload",
         "optional",
@@ -3395,8 +3747,9 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
     let idle = !app.is_recovering();
 
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let plan = ui
+    column.under(ui, |ui| {
+        ui.horizontal(|ui| {
+            let plan = ui
             .add_enabled(
                 has_agent && (has_spl || has_uboot) && has_port && idle,
                 egui::Button::new("Plan recovery..."),
@@ -3409,11 +3762,11 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
                 "Name the port, choose the recovery agent, and choose at least one of an SPL or a \
                  U-Boot payload to write.",
             );
-        if plan.clicked() {
-            app.plan_recovery();
-        }
+            if plan.clicked() {
+                app.plan_recovery();
+            }
 
-        let boot = ui
+            let boot = ui
             .add_enabled(
                 has_spl && has_uboot && has_port && idle,
                 egui::Button::new("Boot U-Boot in RAM"),
@@ -3427,9 +3780,10 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
                 "Name the port, and choose an SPL and a U-Boot payload. The SPL must be a mainline \
                  SPL built to load U-Boot from the UART.",
             );
-        if boot.clicked() {
-            app.ram_boot();
-        }
+            if boot.clicked() {
+                app.ram_boot();
+            }
+        });
     });
 
     // What the board said during the last job, kept once it has ended. The
@@ -3451,6 +3805,7 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
 fn recovery_file_row(
     app: &mut App,
     ui: &mut egui::Ui,
+    column: Column,
     kind: RecoveryFileKind,
     label: &str,
     note: &str,
@@ -3467,6 +3822,7 @@ fn recovery_file_row(
 
     let pressed = file_row(
         ui,
+        column,
         label,
         label,
         chosen,
@@ -3495,9 +3851,10 @@ fn recovery_file_row(
 /// - A bootstrap's two stages
 /// - A maskrom's raw stages
 ///
-/// The row is a label and a *Choose...* button. After them comes either the
-/// file's name and size beside a *Forget* button, or a word saying nothing is
-/// chosen. Each caller says only what it is a row of.
+/// The row is a label in the section's [`Column`] and a *Choose...* button. After
+/// them comes either the file's name and size beside a *Forget* button, or a hint
+/// saying what the file is for. Each caller says only what it is a row of. The
+/// button is the same width on every row, so the names and hints line up as well.
 ///
 /// It returns which button was pressed instead of taking closures. Every caller
 /// acts on `app`, and the row is drawn from a borrow of it. For the same
@@ -3510,6 +3867,7 @@ fn recovery_file_row(
 /// an image file".
 fn file_row(
     ui: &mut egui::Ui,
+    column: Column,
     label: &str,
     what: &str,
     chosen: Option<(String, u64)>,
@@ -3517,8 +3875,7 @@ fn file_row(
     empty: &str,
 ) -> FileRowPressed {
     let mut pressed = FileRowPressed::default();
-    ui.horizontal(|ui| {
-        ui.label(label);
+    column.row(ui, label, |ui| {
         // Disabled while a dialog is up: a file dialog is off-frame, and a second
         // one opened behind the first answers into the same slot.
         pressed.choose = ui
@@ -3604,31 +3961,29 @@ fn recovery_job_panel(app: &App, job: &crate::state::RecoveryJob, ui: &mut egui:
 /// board with a console on a UART is just a port, and nothing on it announces the
 /// board.
 fn console_entry(app: &mut App, ui: &mut egui::Ui) {
-    if app.show_console || app.session.console.is_active() {
-        console_section(app, ui);
-        if app.show_console && !app.session.console.is_active() {
-            ui.horizontal(|ui| {
-                if ui.small_button("Hide serial console").clicked() {
-                    app.show_console = false;
-                }
-            });
-        }
-        return;
-    }
-
     ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("A board with a console on a serial port?");
-        if ui.button("Open serial console...").clicked() {
-            app.show_console = true;
-        }
-    });
+    let active = app.session.console.is_active();
+    let open = app.show_console || active;
+    let toggle = ui
+        .add_enabled_ui(!active, |ui| {
+            disclosure(ui, "Serial console", open, Level::Section)
+        })
+        .inner
+        .explain("Watch what a board prints on its serial port, or drive its U-Boot prompt.")
+        .explain_disabled(
+            "The section stays open while a session runs, a boot change waits to be agreed \
+             to, or a transcript is on screen.",
+        );
+    if toggle.clicked() {
+        app.show_console = !open;
+    }
+    if open {
+        console_section(app, ui);
+    }
 }
 
 /// The console section: the line, the passive watch, and the U-Boot half.
 fn console_section(app: &mut App, ui: &mut egui::Ui) {
-    ui.separator();
-    section_label(ui, "Serial console");
     prose(
         ui,
         "A bootloader prompt is the last stage before an operating system. pyrographer can watch \
@@ -3638,9 +3993,32 @@ fn console_section(app: &mut App, ui: &mut egui::Ui) {
 
     let busy = app.is_console_busy();
 
-    ui.horizontal(|ui| {
-        port_field(app, ui, PortField::Console, "Port for the serial console");
-        named_field(ui, "Baud", |ui| {
+    // Every label the section can draw, the U-Boot part's included, so opening
+    // that part moves nothing above it.
+    let column = Column::fit(
+        ui,
+        &[
+            "Port",
+            "Baud",
+            "Worked",
+            "Failed",
+            "Prompt",
+            "Reads per wait",
+            "Gadget device",
+            "Boot order",
+            "Command",
+        ],
+    );
+
+    port_field(
+        app,
+        ui,
+        column,
+        PortField::Console,
+        "Port for the serial console",
+    );
+    column
+        .field(ui, "Baud", |ui| {
             // **Ranged, and draggable.** It was the only `DragValue` in the crate
             // with no range and the only one with `speed(0.0)`, which made it a
             // click-to-type field wearing a drag control -- and `0` was accepted
@@ -3654,12 +4032,11 @@ fn console_section(app: &mut App, ui: &mut egui::Ui) {
         })
         .explain(
             "115200 is the JH7110 recovery UART's rate, and the default. A board's console \
-                 runs at the rate its build sets. An RK3576's console runs at 1500000.",
+             runs at the rate its build sets. An RK3576's console runs at 1500000.",
         );
-    });
 
-    console_watch(app, ui, busy);
-    console_uboot(app, ui, busy);
+    console_watch(app, ui, column, busy);
+    console_uboot(app, ui, column, busy);
 }
 
 /// The passive watch: the cheapest thing here, and the one that covers the most
@@ -3668,9 +4045,9 @@ fn console_section(app: &mut App, ui: &mut egui::Ui) {
 /// It uses no prompt, no echo handling, no login and no credentials. That is what a
 /// node that runs its own self-test at boot needs from a host. It reports what
 /// appeared and does not assert, and the button's own words say so.
-fn console_watch(app: &mut App, ui: &mut egui::Ui, busy: bool) {
+fn console_watch(app: &mut App, ui: &mut egui::Ui, column: Column, busy: bool) {
     ui.add_space(6.0);
-    ui.strong("Watch");
+    heading(ui, "Watch", Level::Part);
     prose(
         ui,
         "One pattern per line, matched as bytes with no line splitting, so a trailing space is \
@@ -3678,29 +4055,28 @@ fn console_watch(app: &mut App, ui: &mut egui::Ui, busy: bool) {
          \\xNN. The pattern the board printed first is the one reported.",
     );
 
-    ui.horizontal(|ui| {
-        named_field(ui, "Worked", |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut app.console.expect)
-                    .hint_text("PASS")
-                    .desired_rows(2)
-                    .desired_width(200.0),
-            )
-        });
-        named_field(ui, "Failed", |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut app.console.fail)
-                    .hint_text("FAIL")
-                    .desired_rows(2)
-                    .desired_width(200.0),
-            )
-        });
+    column.field(ui, "Worked", |ui| {
+        ui.add(
+            egui::TextEdit::multiline(&mut app.console.expect)
+                .hint_text("PASS")
+                .desired_rows(2)
+                .desired_width(FIELD_WIDTH),
+        )
+    });
+    column.field(ui, "Failed", |ui| {
+        ui.add(
+            egui::TextEdit::multiline(&mut app.console.fail)
+                .hint_text("FAIL")
+                .desired_rows(2)
+                .desired_width(FIELD_WIDTH),
+        )
     });
 
     let has_port = !app.console.port.trim().is_empty();
     let has_pattern = !app.console.expect.trim().is_empty() || !app.console.fail.trim().is_empty();
-    if ui
-        .add_enabled(
+    ui.add_space(4.0);
+    let watch = column.under(ui, |ui| {
+        ui.add_enabled(
             !busy && has_port && has_pattern,
             egui::Button::new("Watch the console..."),
         )
@@ -3708,68 +4084,76 @@ fn console_watch(app: &mut App, ui: &mut egui::Ui, busy: bool) {
             "Name the port, and enter at least one pattern: the text that means the board \
              worked, or the text that means it reported a failure.",
         )
-        .clicked()
-    {
+    });
+    if watch.clicked() {
         let now = app.now();
         app.watch_console(now);
     }
 }
 
-/// The U-Boot half: revealed rather than always drawn.
+/// The U-Boot part: shut until it is asked for.
 ///
 /// A watch needs no prompt and no board knowledge. Driving a prompt needs both: a
-/// prompt string, and the block device a gadget exposes. This half therefore opens
+/// prompt string, and the block device a gadget exposes. This part therefore opens
 /// on request, instead of sitting open in front of a person who only wants to read
 /// a console.
-fn console_uboot(app: &mut App, ui: &mut egui::Ui, busy: bool) {
+///
+/// Each row is a field and then the act that uses it, so a field reads as the
+/// object of the buttons beside it. The fields share a width, and the buttons
+/// therefore start on one line.
+fn console_uboot(app: &mut App, ui: &mut egui::Ui, column: Column, busy: bool) {
     ui.add_space(6.0);
+    if disclosure(ui, "U-Boot prompt", app.console.show_uboot, Level::Part)
+        .explain("Start a gadget, change the boot order for one boot, or type a command.")
+        .clicked()
+    {
+        app.console.show_uboot = !app.console.show_uboot;
+    }
     if !app.console.show_uboot {
-        if ui.button("Drive a U-Boot prompt...").clicked() {
-            app.console.show_uboot = true;
-        }
         return;
     }
 
-    ui.horizontal(|ui| {
-        ui.strong("U-Boot");
-        if ui
-            .small_button("Hide")
-            .named("Hide the U-Boot controls")
-            .clicked()
-        {
-            app.console.show_uboot = false;
-        }
-    });
     prose(
         ui,
         "Every action here first interrupts the autoboot by sending a bare newline. The newline \
          stops a countdown. On a board already at a prompt, it only produces another prompt.",
     );
 
-    ui.horizontal(|ui| {
-        named_field(ui, "Prompt", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.console.prompt).desired_width(90.0))
+    column
+        .field(ui, "Prompt", |ui| {
+            ui.add(egui::TextEdit::singleline(&mut app.console.prompt).desired_width(FIELD_WIDTH))
         })
         .explain(
             "Boards use different prompts, such as \"=> \", \"U-Boot> \", or a board-specific \
              CONFIG_SYS_PROMPT. pyrographer has no built-in list of them. The trailing space is \
              part of the prompt.",
         );
-        named_field(ui, "Reads per wait", |ui| {
+    column
+        .field(ui, "Reads per wait", |ui| {
             ui.add(egui::DragValue::new(&mut app.console.reads).range(1..=600))
         })
         .explain(
             "How long to wait, counted in reads rather than seconds. pyrographer's core reads \
-                 no clock, because Instant::now() panics in a browser. Each read waits about one \
-                 second on an idle line, and returns as soon as bytes arrive.",
+             no clock, because Instant::now() panics in a browser. Each read waits about one \
+             second on an idle line, and returns as soon as bytes arrive.",
         );
-    });
 
     let has_port = !app.console.port.trim().is_empty();
 
     // The far end of the RAM-boot loop: a mainline U-Boot pushed into DRAM from
     // maskrom hands its flash back to the host through one of two gadgets.
-    ui.horizontal(|ui| {
+    let mut gadget = None;
+    column.field(ui, "Gadget device", |ui| {
+        let field = ui
+            .add(
+                egui::TextEdit::singleline(&mut app.console.gadget_dev)
+                    .hint_text("mmc:0")
+                    .desired_width(FIELD_WIDTH),
+            )
+            .explain(
+                "Which block device the gadget exposes. Use the form \
+                 <controller>:<interface>:<index> when the gadget is not on USB controller 0.",
+            );
         if ui
             .add_enabled(
                 !busy && has_port,
@@ -3782,8 +4166,7 @@ fn console_uboot(app: &mut App, ui: &mut egui::Ui, busy: bool) {
             )
             .clicked()
         {
-            let now = app.now();
-            app.start_gadget(Gadget::Rockusb, now);
+            gadget = Some(Gadget::Rockusb);
         }
         if ui
             .add_enabled(
@@ -3797,47 +4180,38 @@ fn console_uboot(app: &mut App, ui: &mut egui::Ui, busy: bool) {
             )
             .clicked()
         {
-            let now = app.now();
-            app.start_gadget(Gadget::Ums, now);
+            gadget = Some(Gadget::Ums);
         }
-        // "on" reads as a preposition on the screen and as nothing at all read
-        // aloud, so the name says which field this is.
-        named_field(ui, "on block device", |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut app.console.gadget_dev)
-                    .hint_text("mmc:0")
-                    .desired_width(90.0),
-            )
-        })
-        .explain(
-            "Which block device the gadget exposes. Use the form <controller>:<interface>:<index> \
-             when the gadget is not on USB controller 0.",
-        );
+        field
     });
+    if let Some(gadget) = gadget {
+        let now = app.now();
+        app.start_gadget(gadget, now);
+    }
 
-    ui.horizontal(|ui| {
-        if ui
+    let mut boot = false;
+    column.field(ui, "Boot order", |ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut app.console.targets)
+                .hint_text("mmc0")
+                .desired_width(FIELD_WIDTH),
+        );
+        boot = ui
             .add_enabled(
                 !busy && has_port && !app.console.targets.trim().is_empty(),
                 egui::Button::new("Boot from..."),
             )
             .explain_disabled("Name the boot order to set, as in mmc0 or `mmc0 usb0`.")
-            .clicked()
-        {
-            let now = app.now();
-            app.plan_boot_override(now);
-        }
-        named_field(ui, "boot order", |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut app.console.targets)
-                    .hint_text("mmc0")
-                    .desired_width(150.0),
-            )
-        });
+            .clicked();
         ui.weak("for one boot, and nothing is saved");
+        field
     });
+    if boot {
+        let now = app.now();
+        app.plan_boot_override(now);
+    }
 
-    console_command(app, ui, busy, has_port);
+    console_command(app, ui, column, busy, has_port);
 }
 
 /// The raw command line, and the one thing on this screen that is ungated.
@@ -3846,16 +4220,14 @@ fn console_uboot(app: &mut App, ui: &mut egui::Ui, busy: bool) {
 /// therefore says so: U-Boot runs whatever is typed. Nothing about it is planned or
 /// confirmed, because typing at a prompt through pyrographer is the same act as
 /// typing at the prompt directly.
-fn console_command(app: &mut App, ui: &mut egui::Ui, busy: bool, has_port: bool) {
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let typed = named_field(ui, "Command", |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut app.console.command)
-                    .hint_text("printenv")
-                    .desired_width(240.0),
-            )
-        });
+fn console_command(app: &mut App, ui: &mut egui::Ui, column: Column, busy: bool, has_port: bool) {
+    let mut run = false;
+    column.field(ui, "Command", |ui| {
+        let typed = ui.add(
+            egui::TextEdit::singleline(&mut app.console.command)
+                .hint_text("printenv")
+                .desired_width(FIELD_WIDTH),
+        );
         let entered = typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let clicked = ui
             .add_enabled(
@@ -3863,16 +4235,20 @@ fn console_command(app: &mut App, ui: &mut egui::Ui, busy: bool, has_port: bool)
                 egui::Button::new("Run"),
             )
             .clicked();
-        if (clicked || entered) && !busy && has_port {
-            let now = app.now();
-            app.run_console_command(now);
-        }
+        run = (clicked || entered) && !busy && has_port;
+        typed
     });
-    ui.colored_label(
-        ui.visuals().warn_fg_color,
-        "This is ungated. U-Boot runs whatever you type, saveenv included, with no plan and no \
-         confirmation.",
-    );
+    if run {
+        let now = app.now();
+        app.run_console_command(now);
+    }
+    column.under(ui, |ui| {
+        guard(
+            ui,
+            "This is ungated. U-Boot runs whatever you type, saveenv included, with no plan and \
+             no confirmation.",
+        );
+    });
 }
 
 /// A boot override waiting to be agreed to.
@@ -3891,44 +4267,53 @@ fn boot_plan(app: &mut App, ui: &mut egui::Ui) {
     let port = pending.line.port.clone();
 
     ui.group(|ui| {
-        ui.strong(format!("Change what the board on {port} boots from?"));
+        heading(
+            ui,
+            format!("Change what the board on {port} boots from?"),
+            Level::Part,
+        );
 
-        ui.horizontal(|ui| {
-            ui.label("boots from now");
-            match &plan.current {
-                Some(current) => {
-                    ui.monospace(current);
-                }
-                None => {
-                    ui.weak("this U-Boot build sets no boot_targets");
-                }
+        let column = Column::fit(ui, &["Boots from now", "Would boot from"]);
+        column.row(ui, "Boots from now", |ui| match &plan.current {
+            Some(current) => {
+                ui.monospace(current);
+            }
+            None => {
+                ui.weak("this U-Boot build sets no boot_targets");
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("would boot from");
+        column.row(ui, "Would boot from", |ui| {
             ui.monospace(&plan.targets);
         });
 
         if plan.is_no_change() {
-            ui.weak("That is the order it already boots in, so this changes nothing.");
+            column.under(ui, |ui| {
+                ui.weak("That is the order it already boots in, so this changes nothing.");
+            });
         }
         if !plan.persistent {
-            ui.label(
-                "The change is not saved. U-Boot keeps its environment in RAM until `saveenv` \
-                 writes it to storage, and the override never sends `saveenv`. The next reset \
-                 restores the board's own boot order. The board boots immediately after the order \
-                 is set.",
-            );
+            column.under(ui, |ui| {
+                prose(
+                    ui,
+                    "The change is not saved. U-Boot keeps its environment in RAM until \
+                     `saveenv` writes it to storage, and the override never sends `saveenv`. The \
+                     next reset restores the board's own boot order. The board boots immediately \
+                     after the order is set.",
+                );
+            });
         }
 
-        ui.horizontal(|ui| {
-            if ui.button("Set it and boot").clicked() {
-                let now = app.now();
-                app.boot_override(now);
-            }
-            if ui.button("Cancel").clicked() {
-                app.session.dismiss_boot_plan();
-            }
+        ui.add_space(4.0);
+        column.under(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Set it and boot").clicked() {
+                    let now = app.now();
+                    app.boot_override(now);
+                }
+                if ui.button("Cancel").clicked() {
+                    app.session.dismiss_boot_plan();
+                }
+            });
         });
     });
 }
@@ -5350,11 +5735,17 @@ fn recovery_confirmation(app: &mut App, ui: &mut egui::Ui, now: f64) {
 /// the rule: there is no sensible default. The sectors column says the same thing
 /// without inventing anything.
 ///
+/// It is a row of the device's frame, labelled Partitions, and the list opens and
+/// shuts under it. Whether it is open is the window's business alone, so it is
+/// kept in egui's memory, one flag for each slot.
+///
 /// [`Board::sector_size`]: crate::state::Board::sector_size
 fn partitions(
     table: &PartitionTable,
     sector_size: Option<u32>,
     flash: Option<&FlashInfo>,
+    column: Column,
+    which: Which,
     ui: &mut egui::Ui,
 ) {
     // The backend's own sector size where there is an open agent to ask, and the
@@ -5368,25 +5759,47 @@ fn partitions(
     // A table recovered from the backup leads with why: the partitions are the
     // backup's, and the device's primary copy is damaged. A person about to write
     // to the board is owed that before the list.
-    if let Some(recovery) = &table.recovery {
-        ui.colored_label(
-            ui.visuals().warn_fg_color,
-            format!(
-                "The primary GPT is damaged. These partitions were recovered from {}.",
-                recovery.recovered_from
+    let salt = match which {
+        Which::Target => "partitions of the target",
+        Which::Source => "partitions of the source",
+    };
+    let id = egui::Id::new(salt);
+    let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(true);
+    let toggle = column.row(ui, "Partitions", |ui| {
+        disclosure(
+            ui,
+            &format!(
+                "{} ({} partitions)",
+                table.format.name(),
+                table.partitions.len()
             ),
-        );
-        ui.weak(format!("Primary GPT: {}", recovery.primary_detail));
+            open,
+            Level::Part,
+        )
+    });
+    if toggle.clicked() {
+        open = !open;
+        ui.data_mut(|data| data.insert_temp(id, open));
     }
 
-    egui::CollapsingHeader::new(format!(
-        "{} ({} partitions)",
-        table.format.name(),
-        table.partitions.len()
-    ))
-    .default_open(true)
-    .show(ui, |ui| {
-        egui::Grid::new("partitions")
+    if let Some(recovery) = &table.recovery {
+        column.under(ui, |ui| {
+            guard(
+                ui,
+                format!(
+                    "The primary GPT is damaged. These partitions were recovered from {}.",
+                    recovery.recovered_from
+                ),
+            );
+            ui.weak(format!("Primary GPT: {}", recovery.primary_detail));
+        });
+    }
+
+    if !open {
+        return;
+    }
+    column.under(ui, |ui| {
+        egui::Grid::new(salt)
             .num_columns(4)
             .striped(true)
             .spacing([16.0, 2.0])
@@ -5727,6 +6140,9 @@ mod tests {
     /// It draws twice, for the same reason [`words`] does.
     fn drawn(mut f: impl FnMut(&mut egui::Ui)) -> String {
         let ctx = egui::Context::default();
+        // The window's own style, so what is read back is what the window draws:
+        // its type scale names a style egui does not ship.
+        crate::theme::install(&ctx);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -6473,7 +6889,10 @@ mod tests {
             recovery: None,
         };
 
-        let guessed = drawn(|ui| partitions(&table, None, None, ui));
+        let guessed = drawn(|ui| {
+            let column = Column::fit(ui, &["Partitions"]);
+            partitions(&table, None, None, column, Which::Target, ui);
+        });
         assert!(
             guessed.contains("8192 sectors"),
             "the sectors are always drawn: {guessed}"
@@ -6483,7 +6902,10 @@ mod tests {
             "and no byte figure is invented from a sector size nothing read: {guessed}"
         );
 
-        let known = drawn(|ui| partitions(&table, Some(4096), None, ui));
+        let known = drawn(|ui| {
+            let column = Column::fit(ui, &["Partitions"]);
+            partitions(&table, Some(4096), None, column, Which::Target, ui);
+        });
         assert!(
             known.contains("32.00 MiB"),
             "with a measured 4Kn geometry the bytes are the device's: {known}"
@@ -6604,14 +7026,14 @@ mod tests {
             "the container path is offered: {shut}"
         );
         assert!(
-            shut.contains("Raw stages..."),
+            shut.contains("Raw stages (no container)"),
             "and so is the other one: {shut}"
         );
 
         app.maskrom.show = true;
         let open = words_on(&mut app, Tab::Flash);
         assert!(
-            open.contains("471 (DRAM init)") && open.contains("472 (loader)"),
+            open.contains("Stage 471") && open.contains("Stage 472"),
             "the form takes both stages: {open}"
         );
         assert!(
@@ -6756,7 +7178,7 @@ mod tests {
         let mut app = an_app();
         let words = words_on(&mut app, Tab::Serial);
         assert!(
-            words.contains("Open serial console"),
+            words.contains("Serial console"),
             "the console is offered as a deliberate action: {words}"
         );
         assert!(
@@ -6870,7 +7292,7 @@ mod tests {
         let mut app = an_app();
         let words = words_on(&mut app, Tab::Serial);
         assert!(
-            words.contains("Start serial recovery"),
+            words.contains("StarFive recovery (serial)"),
             "a JH7110 cannot be discovered, so the flow is offered as a deliberate action: {words}"
         );
         assert!(
@@ -7148,6 +7570,7 @@ mod tests {
             pyrographer_core::verbs::raw_lba_refusal(&a_dfu_board());
         assert!(app.session.target.raw_lba_reason.is_some(), "the premise");
         app.show_table_tools = true;
+        app.author.show = true;
 
         let words = drawn(|ui| table_tools(&mut app, ui, true, 0.0));
         assert!(
@@ -7157,11 +7580,7 @@ mod tests {
         assert!(words.contains("named region"), "in core's words: {words}");
 
         let tree = tree(|ui| table_tools(&mut app, ui, true, 0.0));
-        for name in [
-            "Repair GPT...",
-            "Repair parameter...",
-            "Author a fresh table...",
-        ] {
+        for name in ["Repair GPT...", "Repair parameter...", "Author table..."] {
             let button = tree
                 .controls()
                 .into_iter()
@@ -7264,7 +7683,10 @@ mod tests {
         app.author.show = true;
 
         app.author.format = TableFormat::RockchipParam;
-        let param = drawn(|ui| author_tools(&mut app, ui, true, 0.0));
+        let param = drawn(|ui| {
+            let column = Column::fit(ui, &TABLE_TOOLS_LABELS);
+            author_tools(&mut app, ui, column, true, 0.0);
+        });
         assert!(
             param.contains("Medium") && param.contains("raw NAND"),
             "a parameter table takes a medium: {param}"
@@ -7275,7 +7697,10 @@ mod tests {
         );
 
         app.author.format = TableFormat::Gpt;
-        let gpt = drawn(|ui| author_tools(&mut app, ui, true, 0.0));
+        let gpt = drawn(|ui| {
+            let column = Column::fit(ui, &TABLE_TOOLS_LABELS);
+            author_tools(&mut app, ui, column, true, 0.0);
+        });
         assert!(
             gpt.contains("Format") && gpt.contains("GPT"),
             "the format row is drawn: {gpt}"
@@ -8595,6 +9020,317 @@ mod tests {
         }
     }
 
+    /// The states that between them draw every form and every toggle in the
+    /// window, each with everything opened that can be opened.
+    ///
+    /// A disk's verb surface covers the Boards and disks tab. The serial flows,
+    /// with a boot change waiting, cover the other tab. A board in maskrom and a
+    /// board in a boot ROM each draw a panel of their own in place of the verbs.
+    fn every_form_open() -> Vec<(&'static str, App)> {
+        let mut flash = a_disk_verb_surface();
+        flash.tab = Tab::Flash;
+        flash.session.disks.show = true;
+        flash.session.disks.listed.push(a_disk("/dev/loop0", 0));
+        flash.session.target.table = Table::Read(PartitionTable {
+            format: TableFormat::Gpt,
+            partitions: vec![Partition {
+                name: "boot".to_string(),
+                first_lba: 2048,
+                sectors: 1_048_576,
+            }],
+            recovery: None,
+        });
+        flash.show_table_tools = true;
+        flash.author.show = true;
+        flash.show_firmware_tools = true;
+
+        let mut serial = an_app();
+        serial.tab = Tab::Serial;
+        serial.show_recovery = true;
+        serial.show_console = true;
+        serial.console.show_uboot = true;
+        serial.session.console.pending = Some(crate::state::BootPending {
+            plan: pyrographer_core::uboot::BootPlan {
+                current: Some("mmc1 usb0".to_string()),
+                targets: "mmc0".to_string(),
+                persistent: false,
+            },
+            line: crate::state::ConsoleLine {
+                port: "/dev/ttyUSB0".to_string(),
+                baud: 115_200,
+                prompt: "=> ".to_string(),
+                reads: 30,
+            },
+        });
+
+        let mut maskrom = an_app();
+        maskrom.tab = Tab::Flash;
+        let mut board = a_device(12);
+        board.mode = Mode::Maskrom;
+        board.bcd_usb = 0x0200;
+        maskrom.session.devices_seen(vec![board.clone()], 0.0);
+        maskrom.session.select_target(board.clone(), board);
+        maskrom.maskrom.show = true;
+
+        let mut boot_rom = an_app();
+        boot_rom.tab = Tab::Flash;
+        let mut board = a_device(13);
+        board.mode = Mode::BootRom;
+        boot_rom.session.devices_seen(vec![board.clone()], 0.0);
+        boot_rom.session.select_target(board.clone(), board);
+
+        vec![
+            ("a disk's verb surface", flash),
+            ("the serial flows", serial),
+            ("a board in maskrom", maskrom),
+            ("a board in a boot ROM", boot_rom),
+        ]
+    }
+
+    /// Where each named control's frame starts, across the whole tree.
+    fn left_edges(tree: &Tree) -> Vec<(String, f64)> {
+        tree.0
+            .iter()
+            .filter_map(|(_, node)| {
+                let name = tree.announced(node)?;
+                Some((name, node.bounds()?.x0))
+            })
+            .collect()
+    }
+
+    /// Every label fits the column it is drawn in.
+    ///
+    /// `Column::cell` asserts the fit in a debug build, which is how tests run, so
+    /// drawing every form with everything open is the test: a label missing from
+    /// its section's list stops here rather than pushing a control off the line.
+    #[test]
+    fn every_label_fits_the_column_it_is_drawn_in() {
+        for (what, mut app) in every_form_open() {
+            let words = drawn(|ui| draw(&mut app, ui));
+            assert!(!words.is_empty(), "{what} draws");
+        }
+    }
+
+    /// The controls of a form start on one line, whatever their labels' lengths.
+    ///
+    /// This is what the label column is for. A row drawn as a label and then its
+    /// control starts the control where the label ends, so one label twice as long
+    /// as the others puts its control well to the right of theirs. Each list here
+    /// is one section's controls, found by the names a screen reader announces.
+    #[test]
+    fn a_forms_controls_start_on_one_line() {
+        let sections: [(&str, &[&str]); 3] = [
+            (
+                "the recovery form",
+                &[
+                    "Port for the StarFive recovery",
+                    "Choose... Recovery agent",
+                    "Choose... SPL",
+                    "Choose... U-Boot payload",
+                ],
+            ),
+            (
+                "the console form",
+                &[
+                    "Port for the serial console",
+                    "Baud",
+                    "Worked",
+                    "Failed",
+                    "Prompt",
+                    "Reads per wait",
+                    "Gadget device",
+                    "Boot order",
+                    "Command",
+                ],
+            ),
+            (
+                "the act form",
+                &["By partition", "Choose... an image file", "Partition"],
+            ),
+        ];
+
+        let mut edges = Vec::new();
+        for (_, mut app) in every_form_open() {
+            edges.extend(left_edges(&tree(|ui| draw(&mut app, ui))));
+        }
+
+        for (section, names) in sections {
+            let found: Vec<(&str, f64)> = names
+                .iter()
+                .map(|name| {
+                    let x = edges
+                        .iter()
+                        .find(|(drawn, _)| drawn == name)
+                        .map(|(_, x)| *x)
+                        .unwrap_or_else(|| panic!("{section}: {name:?} is drawn"));
+                    (*name, x)
+                })
+                .collect();
+            let first = found[0].1;
+            for (name, x) in &found {
+                assert!(
+                    (x - first).abs() < 0.5,
+                    "{section}: {name:?} starts at {x}, not on the line its first control \
+                     starts on ({first}): {found:?}"
+                );
+            }
+        }
+    }
+
+    /// No two controls on one screen share a name.
+    ///
+    /// A screen reader moving through the buttons announces each by its name. Two
+    /// controls with one name are two acts a person cannot tell apart that way.
+    /// It is why the read verb that lists the partition table is *Partitions*: the
+    /// section that repairs one is *Partition table*.
+    #[test]
+    fn no_two_controls_on_a_screen_share_a_name() {
+        for (what, mut app) in every_form_open() {
+            let tree = tree(|ui| draw(&mut app, ui));
+            let mut names: Vec<String> = tree
+                .controls()
+                .into_iter()
+                .filter_map(|node| tree.announced(node))
+                .collect();
+            names.sort();
+            let twice: Vec<&String> = names
+                .windows(2)
+                .filter(|pair| pair[0] == pair[1])
+                .map(|pair| &pair[0])
+                .collect();
+            assert!(
+                twice.is_empty(),
+                "{what}: these names are announced more than once: {twice:?}"
+            );
+        }
+    }
+
+    /// Every toggle in the window publishes its state, and none spells it.
+    ///
+    /// One control opens and shuts things, [`disclosure`]. This test finds every
+    /// node that publishes an `expanded` state and requires each section and part
+    /// the window can open to be among them, so a toggle drawn another way, such as
+    /// egui's collapsing header, which publishes no state, fails here.
+    #[test]
+    fn every_toggle_publishes_its_state_and_spells_none_of_it() {
+        let mut toggles = Vec::new();
+        for (what, mut app) in every_form_open() {
+            let tree = tree(|ui| draw(&mut app, ui));
+            for (_, node) in &tree.0 {
+                if node.is_expanded().is_none() {
+                    continue;
+                }
+                let name = tree.announced(node).unwrap_or_default();
+                assert!(
+                    !name.starts_with(['>', 'v']),
+                    "{what}: {name:?} spells its state into its name"
+                );
+                toggles.push(name);
+            }
+        }
+
+        for expected in [
+            "Disks",
+            "1 device with no medium",
+            "GPT (1 partitions)",
+            "Partition table",
+            "Author a fresh table",
+            "Firmware",
+            "StarFive recovery (serial)",
+            "Serial console",
+            "U-Boot prompt",
+            "Raw stages (no container)",
+            "Bootstrap to DFU",
+        ] {
+            assert!(
+                toggles.iter().any(|name| name == expected),
+                "{expected:?} is a toggle that publishes its state; found {toggles:?}"
+            );
+        }
+    }
+
+    /// The headings a sighted reader sees are headings to a screen reader, at the
+    /// level they are drawn at.
+    ///
+    /// A heading drawn as a plain label is structure only a sighted reader gets,
+    /// which SC 1.3.1 asks against. A screen reader moves from heading to heading,
+    /// so the level matters as much as the role.
+    #[test]
+    fn the_headings_on_the_page_are_headings_in_the_tree() {
+        let mut headings = Vec::new();
+        for (_, mut app) in every_form_open() {
+            let tree = tree(|ui| draw(&mut app, ui));
+            for (_, node) in &tree.0 {
+                if node.role() == egui::accesskit::Role::Heading
+                    && let Some(name) = node.label()
+                {
+                    headings.push((name.to_string(), node.level()));
+                }
+            }
+        }
+
+        for (name, level) in [
+            ("Devices", 2),
+            ("Disk", 2),
+            ("Board", 2),
+            ("Read", 3),
+            ("Act", 3),
+            ("Device", 3),
+            ("Watch", 3),
+            ("Bring it to loader mode", 3),
+        ] {
+            assert!(
+                headings
+                    .iter()
+                    .any(|(drawn, at)| drawn == name && *at == Some(level)),
+                "{name:?} is a heading at level {level}; found {headings:?}"
+            );
+        }
+    }
+
+    /// A section's toggle publishes whether the section is open, and its name is the
+    /// section's name alone.
+    ///
+    /// Spelled as text, the triangle was part of the name. A screen reader said
+    /// "greater than, Disks" for a shut section and "v, Disks" for an open one,
+    /// and published no state. This test pins the state on the node and a name
+    /// with no glyph in it, for each section drawn shut and open.
+    #[test]
+    fn a_section_toggle_publishes_its_state_and_a_name_without_a_glyph() {
+        use egui::accesskit::Role;
+
+        fn toggle(tree: &Tree, name: &str) -> Option<bool> {
+            let found: Vec<_> = tree
+                .0
+                .iter()
+                .map(|(_, node)| node)
+                .filter(|node| node.role() == Role::Button && node.label() == Some(name))
+                .collect();
+            assert_eq!(found.len(), 1, "one toggle is named exactly {name:?}");
+            found[0].is_expanded()
+        }
+
+        for open in [false, true] {
+            let mut app = an_app();
+            app.session.disks.show = open;
+            app.show_table_tools = open;
+            app.show_firmware_tools = open;
+
+            let drawn = tree(|ui| disks(&mut app, ui));
+            assert_eq!(toggle(&drawn, "Disks"), Some(open), "Disks");
+
+            let drawn = tree(|ui| table_tools(&mut app, ui, true, 0.0));
+            assert_eq!(
+                toggle(&drawn, "Partition table"),
+                Some(open),
+                "Partition table"
+            );
+
+            let drawn = tree(|ui| firmware_tools(&mut app, ui, true, 0.0));
+            assert_eq!(toggle(&drawn, "Firmware"), Some(open), "Firmware");
+        }
+    }
+
     /// The current tab is marked by a shape, not only by a color.
     ///
     /// The choice follows from measurement. egui paints a selected button in
@@ -8939,10 +9675,18 @@ mod tests {
         // position is half the assertion: the screen's header draws a full-width
         // separator of its own, and a test that only counted widths would be
         // satisfied by that one and would pass with no rail at all.
+        //
+        // The tabs are the topmost row of frameless controls. A section toggle is
+        // frameless at rest as well, and stands further down the page.
         let page = 1000.0 - 2.0 * f32::from(crate::theme::PAGE_MARGIN.left);
-        let foot = bare
+        let top = bare
             .iter()
             .filter(|rect| is_tab_sized(rect))
+            .map(|rect| rect.top())
+            .fold(f32::MAX, f32::min);
+        let foot = bare
+            .iter()
+            .filter(|rect| is_tab_sized(rect) && (rect.top() - top).abs() < 1.0)
             .map(|rect| rect.bottom())
             .fold(f32::MIN, f32::max);
         assert!(
