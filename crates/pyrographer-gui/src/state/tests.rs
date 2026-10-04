@@ -20,7 +20,6 @@ use pyrographer_core::codec::{splhdr, xmodem};
 use pyrographer_core::discovery::{DeviceInfo, Mode, Vendor};
 use pyrographer_core::image::{SyncReader, SyncWriter};
 use pyrographer_core::partition::TableFormat;
-use pyrographer_core::recovery::RecoveryTarget;
 use pyrographer_core::testing::{
     CHIP_VERSION, FLASH_SECTORS, a_boards_partitions, cbw, cbw_with_subcode, gpt_copy, gpt_table,
     scripted_chip_version, scripted_gpt, scripted_info, scripted_plan, scripted_plan_with_gpt,
@@ -1585,21 +1584,78 @@ fn a_blob(bytes: Vec<u8>) -> PickedBlob {
     }
 }
 
-/// The steps a receiver plays for a clean XMODEM send of `data`.
+/// The recovery agent's main prompt, which an agent file carries and the agent
+/// prints.
+const AGENT_PROMPT: &[u8] = b"select the function to test: ";
+
+/// A recovery agent as the plan checks one: headered, with its menu in it.
+fn a_recovery_agent() -> Vec<u8> {
+    let mut body = b"agent ".to_vec();
+    body.extend_from_slice(AGENT_PROMPT);
+    body.extend_from_slice(&[0xa9; 120]);
+    splhdr::build(&body)
+}
+
+/// A U-Boot payload: a FIT, so it begins with the devicetree magic.
+fn a_fit() -> Vec<u8> {
+    let mut fit = vec![0xd0, 0x0d, 0xfe, 0xed];
+    fit.extend((0..300u32).map(|i| (i * 13) as u8));
+    fit
+}
+
+/// The steps a receiver plays for a clean XMODEM send of `data`: an `ACK` for
+/// every 128-byte block and for the `EOT`.
 ///
-/// The receiver sends a short `C` storm, then an `ACK` for every 128-byte block and
-/// for the `EOT`. It is the same conversation `recovery.rs` scripts in core, so the
-/// bytes this asserts are the bytes a real recovery sends.
-fn scripted_send(data: &[u8]) -> Vec<SerialStep> {
-    let mut steps = vec![SerialStep::Rx(vec![xmodem::CRC_REQUEST; 4])];
-    let mut seq = 1u8;
-    for chunk in data.chunks(xmodem::BLOCK_DATA) {
-        steps.push(SerialStep::ExpectTx(xmodem::block(seq, chunk)));
+/// It is the same conversation core's `recovery` tests script, so the bytes this
+/// asserts are the bytes a real recovery sends.
+fn acked(data: &[u8]) -> Vec<SerialStep> {
+    let mut steps = Vec::new();
+    for (i, chunk) in data.chunks(128).enumerate() {
+        steps.push(SerialStep::ExpectTx(xmodem::block(
+            xmodem::BlockSize::Small,
+            (i + 1) as u8,
+            chunk,
+        )));
         steps.push(SerialStep::Rx(vec![xmodem::ACK]));
-        seq = seq.wrapping_add(1);
     }
     steps.push(SerialStep::ExpectTx(vec![xmodem::EOT]));
     steps.push(SerialStep::Rx(vec![xmodem::ACK]));
+    steps
+}
+
+/// The BootROM asking for a file with a run of `C`s, and taking `image`.
+fn rom_takes(image: &[u8]) -> Vec<SerialStep> {
+    let mut steps = vec![SerialStep::Rx(b"(C)StarFive\r\nCCCCCCCCCCCC".to_vec())];
+    steps.extend(acked(image));
+    steps
+}
+
+/// The agent's menu, ending at its prompt.
+fn agent_menu() -> SerialStep {
+    let mut menu = b"\r\n0: update 2ndboot/SPL in flash\r\n5: exit\r\n".to_vec();
+    menu.extend_from_slice(AGENT_PROMPT);
+    SerialStep::Rx(menu)
+}
+
+/// The agent writing a U-Boot payload under menu entry 2, start to finish, and
+/// halting.
+fn agent_writes_uboot(uboot: &[u8]) -> Vec<SerialStep> {
+    let mut steps = vec![
+        agent_menu(),
+        SerialStep::ExpectTx(b"\r".to_vec()),
+        agent_menu(),
+        SerialStep::ExpectTx(b"2\r".to_vec()),
+        SerialStep::Rx(b"2\r\nsend file by xmodem\r\nCCCCCCCCCCCC".to_vec()),
+    ];
+    steps.extend(acked(uboot));
+    steps.push(SerialStep::Rx(
+        b"updata first section\r\n....\r\nupdata success\r\n".to_vec(),
+    ));
+    steps.push(agent_menu());
+    steps.push(SerialStep::ExpectTx(b"\r".to_vec()));
+    steps.push(agent_menu());
+    steps.push(SerialStep::ExpectTx(b"5\r".to_vec()));
+    steps.push(SerialStep::Rx(b"5\r\nEND OF SECONDBOOT\r\n".to_vec()));
     steps
 }
 
@@ -1618,40 +1674,40 @@ fn type_recovery_port(session: &mut Session<ScriptedTransport>, what: &str) {
 
 /// A confirmed recovery, minted through the whole gate (plan, type the port,
 /// confirm), for a test that needs one to hand to `start_recovery`.
-fn a_confirmed_recovery() -> (OwnedRecoveryRequest, ConfirmedRecovery) {
+fn a_confirmed_recovery() -> StarfiveTask {
     let mut session: Session<ScriptedTransport> = Session::new(ConfirmBy::Coordinate);
-    session.set_recovery_agent(Some(a_blob(vec![0u8; 8])));
-    session.set_recovery_spl(Some(a_blob(vec![0u8; 8])));
+    session.set_recovery_agent(Some(a_blob(a_recovery_agent())));
+    session.set_recovery_uboot(Some(a_blob(a_fit())));
     session
-        .plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash)
+        .plan_recovery("/dev/ttyUSB0".to_string())
         .expect("a plan");
     type_recovery_port(&mut session, "/dev/ttyUSB0");
     let (_, request, confirmed) = session.confirm_recovery().expect("the port was typed");
-    (request, confirmed)
+    StarfiveTask::Recover { request, confirmed }
 }
 
 /// The StarFive recovery flow, end to end, with neither a board nor a window.
 ///
 /// Files are picked, and a plan is made without touching a serial line. The port is
 /// typed to confirm, and the recovery runs against a scripted serial that asserts
-/// every byte. The agent is uploaded first. The SPL is then headered for NOR and
-/// sent under menu option `0`, and the menu is exited with `5`.
+/// every byte. The agent goes to the ROM once it asks, U-Boot goes under menu
+/// entry `2` once the agent asks, and the agent is halted with `5`. What the agent
+/// printed is kept after the job, because its own words are the account of a write.
 ///
 /// This test pins the state wiring (plan, confirm, start, harvest), and core's
-/// `recovery` tests pin the framing. Together they pin that the GUI sends exactly
-/// the bytes a recovery requires.
+/// `recovery` tests pin the conversation. Together they pin that the GUI sends
+/// exactly the bytes a recovery requires.
 #[test]
 fn a_recovery_plans_confirms_and_runs_against_a_scripted_serial() {
-    let agent = vec![0xa9u8; 200]; // two blocks
-    let spl_body = vec![0x5au8; 50];
-    let framed_spl = splhdr::build(&spl_body, splhdr::Target::NorFlash);
+    let agent = a_recovery_agent();
+    let uboot = a_fit();
 
     let mut session: Session<ScriptedTransport> = Session::new(ConfirmBy::Coordinate);
     session.set_recovery_agent(Some(a_blob(agent.clone())));
-    session.set_recovery_spl(Some(a_blob(spl_body.clone())));
+    session.set_recovery_uboot(Some(a_blob(uboot.clone())));
 
     session
-        .plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash)
+        .plan_recovery("/dev/ttyUSB0".to_string())
         .expect("a plan");
 
     {
@@ -1666,43 +1722,38 @@ fn a_recovery_plans_confirms_and_runs_against_a_scripted_serial() {
         );
         assert_eq!(pending.port, "/dev/ttyUSB0");
         assert_eq!(pending.plan.stages.len(), 1);
-        assert_eq!(pending.plan.stages[0].menu_option, 0);
-        assert_eq!(
-            pending.plan.stages[0].image_bytes,
-            (splhdr::HEADER_LEN + spl_body.len()) as u64,
-            "the plan counts the headered size that crosses the wire, not the file on disk"
-        );
+        assert_eq!(pending.plan.stages[0].menu_option, 2);
+        assert_eq!(pending.plan.stages[0].offset, 0x10_0000);
     }
 
     type_recovery_port(&mut session, "/dev/ttyUSB0");
     let (port, request, confirmed) = session.confirm_recovery().expect("the port was typed");
     assert_eq!(port, "/dev/ttyUSB0", "the port is handed back to open");
 
-    // The scripted receiver: agent, menu 0, framed SPL, menu 5 (exit). The
-    // `ExpectTx` steps assert the exact bytes, so a wrong block fails here.
-    let mut steps = scripted_send(&agent);
-    steps.push(SerialStep::ExpectTx(vec![b'0']));
-    steps.extend(scripted_send(&framed_spl));
-    steps.push(SerialStep::ExpectTx(vec![b'5']));
+    let mut steps = rom_takes(&agent);
+    steps.extend(agent_writes_uboot(&uboot));
     let serial = ScriptedSerial::new(steps);
 
     let work = session
-        .start_recovery(serial, request, confirmed, 0.0, no_wake())
+        .start_recovery(
+            serial,
+            StarfiveTask::Recover { request, confirmed },
+            0.0,
+            no_wake(),
+        )
         .expect("nothing else is running, so a recovery can start");
     assert!(session.recovery.job.is_some(), "the recovery is in flight");
 
-    let (other_request, other_confirmed) = a_confirmed_recovery();
     assert!(
         session
             .start_recovery(
                 ScriptedSerial::new(vec![]),
-                other_request,
-                other_confirmed,
+                a_confirmed_recovery(),
                 0.0,
                 no_wake(),
             )
             .is_none(),
-        "a second recovery cannot start while one runs"
+        "a second StarFive job cannot start while one runs"
     );
 
     pollster::block_on(work.run());
@@ -1715,39 +1766,52 @@ fn a_recovery_plans_confirms_and_runs_against_a_scripted_serial() {
         matches!(session.last, Some(Ok(Report::Recovered))),
         "and it is reported recovered"
     );
+    assert!(
+        session.recovery.transcript.contains("updata success"),
+        "the agent's words are kept: {}",
+        session.recovery.transcript
+    );
 }
 
 /// A recovery plan refuses what it can before a serial line is opened.
 ///
-/// It refuses a plan with no agent, with nothing to write, or with no port named.
-/// Each is a usage problem the plan catches, not a failure a board reports.
+/// It refuses a plan with no agent, with nothing to write, with no port named, and
+/// with an SPL whose backup copy would land in a U-Boot nobody is writing. Each is
+/// a usage problem the plan catches, not a failure a board reports.
 #[test]
 fn planning_a_recovery_refuses_what_it_should() {
     let mut session: Session<ScriptedTransport> = Session::new(ConfirmBy::Coordinate);
 
     // No agent.
     assert!(matches!(
-        session.plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash),
+        session.plan_recovery("/dev/ttyUSB0".to_string()),
         Err(Error::InvalidRequest(_))
     ));
 
     // An agent, but nothing to write.
-    session.set_recovery_agent(Some(a_blob(vec![0u8; 16])));
+    session.set_recovery_agent(Some(a_blob(a_recovery_agent())));
     assert!(matches!(
-        session.plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash),
+        session.plan_recovery("/dev/ttyUSB0".to_string()),
+        Err(Error::InvalidRequest(_))
+    ));
+
+    // An SPL alone, whose backup copy would break the U-Boot on the board.
+    session.set_recovery_spl(Some(a_blob(vec![0x5a; 64])));
+    assert!(matches!(
+        session.plan_recovery("/dev/ttyUSB0".to_string()),
         Err(Error::InvalidRequest(_))
     ));
 
     // Something to write, but no port.
-    session.set_recovery_spl(Some(a_blob(vec![0u8; 16])));
+    session.set_recovery_uboot(Some(a_blob(a_fit())));
     assert!(matches!(
-        session.plan_recovery("   ".to_string(), RecoveryTarget::NorFlash),
+        session.plan_recovery("   ".to_string()),
         Err(Error::InvalidRequest(_))
     ));
 
-    // All three: a plan, and nothing was refused.
+    // All of it: a plan, and nothing was refused.
     session
-        .plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash)
+        .plan_recovery("/dev/ttyUSB0".to_string())
         .expect("a plan");
     assert!(session.recovery.pending.is_some());
 }
@@ -1759,10 +1823,10 @@ fn planning_a_recovery_refuses_what_it_should() {
 #[test]
 fn a_recovery_plan_is_thrown_away_by_a_changed_file_and_confirms_nothing_on_a_wrong_port() {
     let mut session: Session<ScriptedTransport> = Session::new(ConfirmBy::Coordinate);
-    session.set_recovery_agent(Some(a_blob(vec![0xa9u8; 32])));
-    session.set_recovery_spl(Some(a_blob(vec![0x5au8; 32])));
+    session.set_recovery_agent(Some(a_blob(a_recovery_agent())));
+    session.set_recovery_uboot(Some(a_blob(a_fit())));
     session
-        .plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash)
+        .plan_recovery("/dev/ttyUSB0".to_string())
         .expect("a plan");
 
     // A port typed wrong confirms nothing, and the plan stays.
@@ -1774,10 +1838,106 @@ fn a_recovery_plan_is_thrown_away_by_a_changed_file_and_confirms_nothing_on_a_wr
     );
 
     // Changing any file throws the plan away: it described a write of the old ones.
-    session.set_recovery_uboot(Some(a_blob(vec![0x33u8; 16])));
+    session.set_recovery_spl(Some(a_blob(vec![0x5au8; 16])));
     assert!(
         session.recovery.pending.is_none(),
         "the plan described a write of the old files, and these are not those files"
+    );
+}
+
+/// The RAM boot, end to end, with neither a board nor a window.
+///
+/// It needs no plan screen and no confirmation, because it writes nothing. Its
+/// files are checked when it is prepared, and it runs against a scripted serial
+/// that prints what the ROM, the SPL and U-Boot print and asserts every byte sent:
+/// the SPL to the ROM, U-Boot to the SPL by YMODEM, and a carriage return that
+/// stops the countdown. It is reported as booted, and U-Boot's text is kept.
+#[test]
+fn a_ram_boot_runs_against_a_scripted_serial_and_stops_at_the_prompt() {
+    let spl = vec![0x5au8; 64];
+    let uboot = a_fit();
+
+    let mut session: Session<ScriptedTransport> = Session::new(ConfirmBy::Coordinate);
+    session.set_recovery_spl(Some(a_blob(spl.clone())));
+    session.set_recovery_uboot(Some(a_blob(uboot.clone())));
+    let boot = session
+        .prepare_ram_boot("/dev/ttyUSB0", "=> ")
+        .expect("both files, and a port");
+
+    let mut steps = rom_takes(&splhdr::build(&spl));
+    steps.push(SerialStep::Rx(
+        b"U-Boot SPL 2025.10\r\nTrying to boot from UART\r\nC".to_vec(),
+    ));
+    steps.push(SerialStep::ExpectTx(xmodem::ymodem_header(
+        "u-boot.itb",
+        uboot.len() as u64,
+    )));
+    steps.push(SerialStep::Rx(vec![xmodem::ACK, xmodem::CRC_REQUEST]));
+    steps.push(SerialStep::ExpectTx(xmodem::block(
+        xmodem::BlockSize::Large,
+        1,
+        &uboot,
+    )));
+    steps.push(SerialStep::Rx(vec![xmodem::ACK]));
+    steps.push(SerialStep::ExpectTx(vec![xmodem::EOT]));
+    steps.push(SerialStep::Rx(vec![
+        xmodem::ACK,
+        xmodem::ACK,
+        xmodem::CRC_REQUEST,
+    ]));
+    steps.push(SerialStep::ExpectTx(xmodem::ymodem_end()));
+    steps.push(SerialStep::Rx(vec![xmodem::ACK]));
+    steps.push(SerialStep::Rx(
+        b"U-Boot 2025.10\r\nHit any key to stop autoboot:  2 ".to_vec(),
+    ));
+    steps.push(SerialStep::ExpectTx(b"\r".to_vec()));
+    steps.push(SerialStep::Rx(b"\r\n=> ".to_vec()));
+    let serial = ScriptedSerial::new(steps);
+
+    let work = session
+        .start_recovery(serial, StarfiveTask::RamBoot(boot), 0.0, no_wake())
+        .expect("nothing else is running");
+    pollster::block_on(work.run());
+    assert!(session.harvest_recovery());
+    assert!(
+        matches!(session.last, Some(Ok(Report::UartBooted))),
+        "it is reported booted"
+    );
+    assert!(
+        session
+            .recovery
+            .transcript
+            .contains("Trying to boot from UART"),
+        "{}",
+        session.recovery.transcript
+    );
+}
+
+/// A RAM boot refuses before the port is opened: with no port, with a file
+/// missing, and with the SPL and U-Boot given in each other's place.
+#[test]
+fn preparing_a_ram_boot_refuses_what_it_should() {
+    let mut session: Session<ScriptedTransport> = Session::new(ConfirmBy::Coordinate);
+    session.set_recovery_spl(Some(a_blob(vec![0x5a; 64])));
+    assert!(
+        session.prepare_ram_boot("/dev/ttyUSB0", "=> ").is_err(),
+        "no U-Boot"
+    );
+
+    session.set_recovery_uboot(Some(a_blob(a_fit())));
+    assert!(session.prepare_ram_boot(" ", "=> ").is_err(), "no port");
+    session
+        .prepare_ram_boot("/dev/ttyUSB0", "=> ")
+        .expect("both files and a port");
+
+    session.set_recovery_spl(Some(a_blob(a_fit())));
+    session.set_recovery_uboot(Some(a_blob(vec![0x5a; 64])));
+    assert!(
+        matches!(
+            session.prepare_ram_boot("/dev/ttyUSB0", "=> "),
+            Err(Error::InvalidRequest(_))
+        ),
+        "the two files swapped"
     );
 }
 

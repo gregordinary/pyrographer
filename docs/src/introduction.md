@@ -51,12 +51,13 @@ uncached. It refuses every disk the running system depends on, with no override.
 
 ## Bootstrapping and recovery
 
-Three commands serve one vendor each:
+Four commands serve one vendor each:
 
 - `db` uploads a loader to a Rockchip board in maskrom, the BootROM's USB download mode.
 - `usbboot` uploads two stages to an Ingenic boot ROM, which brings the device up in DFU.
-- `recover` writes a bootloader to a StarFive board over serial. The recovery mode cannot read
-  flash, so the write is not read back.
+- `recover` writes a bootloader to a StarFive board's flash over serial. The recovery mode cannot
+  read flash, so the write is not read back.
+- `uartboot` boots a StarFive board into U-Boot over serial, and writes nothing.
 
 ## Bootloader prompts
 

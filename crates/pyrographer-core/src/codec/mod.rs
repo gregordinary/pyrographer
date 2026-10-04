@@ -47,9 +47,9 @@
 //!
 //! # StarFive recovery
 //!
-//! [`xmodem`] is the block the JH7110 BootROM and its recovery agent receive over
-//! UART. [`splhdr`] is the 1024-byte header the ROM requires on the first image it
-//! loads.
+//! [`xmodem`] is the block the JH7110 BootROM, its recovery agent and a U-Boot SPL
+//! receive over UART, and the two YMODEM batch blocks. [`splhdr`] is the 1024-byte
+//! header the ROM requires on the first image it loads.
 //!
 //! # Console
 //!

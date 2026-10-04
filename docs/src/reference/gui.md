@@ -385,30 +385,52 @@ device list. Recovery is on the **Serial** tab, behind *Start serial recovery...
 Strap the board into UART recovery, connect a USB-serial adapter, and fill in the form:
 
 1. Name the port the adapter appears on, such as `/dev/ttyUSB0` or `COM3`.
-2. Choose the medium, QSPI NOR flash or eMMC. The two need different SPL headers, and sending one
-   to the other's slot leaves the board unable to boot. The window builds the header for the
-   medium you pick.
-3. Choose the files. The recovery agent, `jh7110-recovery-*.bin`, is always uploaded first. Then
-   choose at least one of an SPL, `u-boot-spl.bin`, and a U-Boot payload.
+2. Choose the files. A recovery sends the recovery agent, `jh7110-recovery-*.bin`, first. Choose
+   an SPL, as `u-boot-spl.bin` or `u-boot-spl.bin.normal.out`, and a U-Boot payload.
 
 In the web flasher, *Choose port...* takes the place of the path field and opens the browser's
 chooser, as [The web flasher](#the-web-flasher) describes.
 
-*Plan recovery...* shows what will be written and where. It also states the one way a StarFive
-recovery differs from every other write:
+The section offers two jobs, and both start once you power the board on:
+
+- *Plan recovery...* writes the board's QSPI NOR flash through the recovery agent. It needs the
+  agent and at least one of the SPL and U-Boot, and an SPL needs U-Boot beside it.
+- *Boot U-Boot in RAM* sends the SPL and U-Boot without the agent, and writes nothing. It is
+  described below.
+
+### Writing the boot flash
+
+*Plan recovery...* shows what will be written and where. The SPL goes at `0x0` and U-Boot at
+`0x100000`, and the agent writes a backup copy of the SPL at `0x200000`. The plan also states the
+one way a StarFive recovery differs from every other write:
 
 > This board's write is not read back.
 
-The recovery protocol cannot read flash. Each transfer is confirmed only by the receiver
-acknowledging the bytes, which does not prove the flash holds them. The plan states this before
-you confirm.
+The recovery protocol cannot read flash. Each block is acknowledged as it is received, and the
+agent reports whether each write finished. Neither proves the flash holds the file. The plan
+states this before you confirm.
 
-To confirm, type the port path, as a board write asks for its bus address. The window uploads the
-agent and sends the files, then reports that the transfer was acknowledged but not verified.
-Power off the board, set the boot strap back to normal, and power on.
+To confirm, type the port path, as a board write asks for its bus address. The window sends the
+agent and then each file, and shows what the agent prints as it writes. It reports a write the
+agent says failed as an error, in the agent's own words. Afterward, power off the board, set the
+boot strap back to normal, and power on.
 
-The recovery agent also offers OTP fuse burning. The window never shows it, because a burned fuse
-cannot be reversed. The whole recovery is `[UNVERIFIED]` against hardware.
+The window types at the agent's menu only when the agent asks. The agent also offers OTP fuse
+burning, and the window never chooses it, because a burned fuse cannot be reversed. If the fuse
+menu ever appears, the job stops and tells you to power the board off. The whole recovery is
+`[UNVERIFIED]` against hardware.
+
+### Booting U-Boot in RAM
+
+*Boot U-Boot in RAM* sends the SPL to the BootROM, and the SPL loads U-Boot over the same serial
+line. The window then stops U-Boot at its prompt, which it recognizes by the prompt the serial
+console's form names, `=> ` by default. Nothing is written, so there is no plan to confirm. The SPL must be a mainline SPL built to load
+U-Boot from the UART.
+
+From there, the serial console starts U-Boot's mass-storage gadget on the same port. The board's
+eMMC then appears under **Disks**, where a write reads back every window, as
+[Writing a StarFive eMMC as a disk](cli/serial.md#writing-a-starfive-emmc-as-a-disk) describes.
+The RAM boot is `[UNVERIFIED]` against hardware.
 
 ## The serial console
 

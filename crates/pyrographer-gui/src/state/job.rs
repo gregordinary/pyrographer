@@ -24,6 +24,7 @@
 use pyrographer_core::Error;
 use pyrographer_core::agent::{FlashAgent, FlashInfo, ReadBack};
 use pyrographer_core::bootstrap::ingenic::IngenicLoader;
+use pyrographer_core::bootstrap::starfive;
 use pyrographer_core::codec::console as console_codec;
 use pyrographer_core::codec::ingenic_boot::CpuInfo;
 use pyrographer_core::codec::rkboot::LoaderImage;
@@ -35,7 +36,7 @@ use pyrographer_core::image::ImageReader;
 use pyrographer_core::layout::Layout;
 use pyrographer_core::partition::{PartitionTable, TableFormat};
 use pyrographer_core::progress::{Cancel, Progress};
-use pyrographer_core::recovery::{self, ConfirmedRecovery, RecoveryTarget};
+use pyrographer_core::recovery::{self, ConfirmedRecovery};
 use pyrographer_core::soc::Soc;
 use pyrographer_core::transport::{Serial, Transport};
 use pyrographer_core::uboot::{BootPlan, ConfirmedBoot, Gadget, GadgetDevice, UBoot};
@@ -404,9 +405,12 @@ pub enum Report {
     /// A StarFive board was recovered over serial.
     ///
     /// The agent was uploaded, and the SPL, the U-Boot or both were written through
-    /// its menu. The transfer was acknowledged, but the write was **not** read
-    /// back, because the recovery protocol cannot read flash.
+    /// its menu. The agent reported each write as done, but the write was **not**
+    /// read back, because the recovery protocol cannot read flash.
     Recovered,
+    /// A StarFive board was booted into U-Boot in RAM over serial, and U-Boot is
+    /// stopped at its prompt. Nothing was written.
+    UartBooted,
     /// A table write landed, and every window of it was read back.
     ///
     /// The write was a repair that rewrote damaged copies, or a freshly authored
@@ -1380,13 +1384,10 @@ impl<T: Transport> IngenicBootstrapWork<T> {
 /// as a file and read when it is needed.
 #[derive(Clone)]
 pub struct OwnedRecoveryRequest {
-    /// The boot medium both stages are written to.
-    pub target: RecoveryTarget,
     /// The recovery agent (`jh7110-recovery-*.bin`), uploaded into SRAM first.
     pub agent: Vec<u8>,
-    /// A raw `u-boot-spl.bin`, headered for the target inside [`recovery::recover`].
-    /// Optional, but the plan has already refused a recovery that named neither
-    /// this nor [`uboot`](Self::uboot).
+    /// The SPL, raw or headered. Optional, but the plan has already refused a
+    /// recovery that named neither this nor [`uboot`](Self::uboot).
     pub spl: Option<Vec<u8>>,
     /// A U-Boot FIT payload, sent as-is. Optional, on the same terms as `spl`.
     pub uboot: Option<Vec<u8>>,
@@ -1396,7 +1397,6 @@ impl OwnedRecoveryRequest {
     /// Borrow the owned bytes into the shape [`recovery::recover`] takes.
     pub fn as_request(&self) -> recovery::RecoveryRequest<'_> {
         recovery::RecoveryRequest {
-            target: self.target,
             agent: &self.agent,
             spl: self.spl.as_deref(),
             uboot: self.uboot.as_deref(),
@@ -1404,26 +1404,102 @@ impl OwnedRecoveryRequest {
     }
 }
 
-/// What a running recovery publishes and the frame loop reads.
+/// Everything a StarFive RAM boot sends, owned so that a job can hold it.
 ///
-/// The recovery counterpart of [`BootstrapPublished`]. A recovery holds no agent
-/// to hand back either, because it drives a serial line the port owns rather than
-/// a [`FlashAgent`]. Its ending is a bare outcome.
+/// The RAM boot's counterpart of [`OwnedRecoveryRequest`], with the prompt of the
+/// U-Boot being sent, because the job stops that U-Boot at its prompt.
+#[derive(Clone)]
+pub struct OwnedUartBoot {
+    /// The SPL, raw or headered, built to load U-Boot by YMODEM.
+    pub spl: Vec<u8>,
+    /// The `u-boot.itb` the SPL loads.
+    pub uboot: Vec<u8>,
+    /// The prompt that U-Boot presents.
+    pub prompt: String,
+}
+
+impl OwnedUartBoot {
+    /// Borrow the owned bytes into the shape [`starfive::uart_boot`] takes.
+    pub fn as_request(&self) -> starfive::UartBootRequest<'_> {
+        starfive::UartBootRequest {
+            spl: &self.spl,
+            uboot: &self.uboot,
+        }
+    }
+}
+
+/// What a StarFive job does over an opened serial line.
+///
+/// Both start the same way, by sending a file to the BootROM, and both report a
+/// transfer's progress and the board's text. They differ in what is sent and in
+/// whether a person had to agree to it.
+pub enum StarfiveTask {
+    /// Write the boot flash through the recovery agent, as a person agreed to.
+    Recover {
+        /// The agent, and whichever of the SPL and U-Boot payload were chosen.
+        request: OwnedRecoveryRequest,
+        /// The plan, confirmed.
+        confirmed: ConfirmedRecovery,
+    },
+    /// Boot U-Boot in RAM, and stop it at its prompt. It writes nothing, so no
+    /// confirmation stands in front of it.
+    RamBoot(OwnedUartBoot),
+}
+
+impl StarfiveTask {
+    /// What to call this on screen while it runs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            StarfiveTask::Recover { .. } => "Recovering over serial",
+            StarfiveTask::RamBoot(_) => "Booting U-Boot in RAM over serial",
+        }
+    }
+}
+
+/// What a running StarFive job publishes and the frame loop reads.
+///
+/// The serial counterpart of [`BootstrapPublished`]. It holds no agent to hand
+/// back either, because it drives a serial line the port owns rather than a
+/// [`FlashAgent`]. It publishes the current transfer's progress, and the text the
+/// board printed between transfers, because the recovery agent prints its writes
+/// as they happen and a long flash write that showed nothing would look hung.
 #[derive(Default)]
 struct RecoveryPublished {
     /// The most recent progress event.
     progress: Option<Progress>,
-    /// Set exactly once, when the recovery ends, however it ends.
-    ended: Option<Result<(), Error>>,
+    /// The end of the transcript so far.
+    transcript: Vec<u8>,
+    /// How many bytes have come off the line in all. See [`ConsolePublished`].
+    seen: u64,
+    /// Set exactly once, when the job ends, however it ends.
+    ended: Option<Result<Report, Error>>,
 }
 
-/// A StarFive recovery in flight, from the frame loop's side.
+impl RecoveryPublished {
+    /// Take bytes off the line, keeping the tail.
+    fn push(&mut self, bytes: &[u8]) {
+        self.transcript.extend_from_slice(bytes);
+        self.seen = self.seen.saturating_add(bytes.len() as u64);
+        if self.transcript.len() > TRANSCRIPT_TAIL {
+            let over = self.transcript.len() - TRANSCRIPT_TAIL;
+            self.transcript.drain(..over);
+        }
+    }
+}
+
+/// A StarFive job in flight, from the frame loop's side.
 ///
 /// The serial counterpart of [`BootstrapJob`]. Like it, it is not generic over a
-/// transport, because it holds nothing to hand back. Its progress is the XMODEM
-/// transfer's. Its ending is a bare outcome, because **the write is not read
-/// back**: there is nothing to compare and no agent to restore.
+/// transport, because it holds nothing to hand back. Its progress is the current
+/// XMODEM or YMODEM transfer's, and beside it is the board's transcript. A
+/// recovery's ending is a bare outcome, because **the write is not read back**:
+/// there is nothing to compare and no agent to restore.
 pub struct RecoveryJob {
+    /// What to call it on screen.
+    pub label: &'static str,
+    /// Whether it writes the board's flash. A recovery does, and a RAM boot does
+    /// not, and the panel says which.
+    pub writes: bool,
     /// When it began, on the frame clock. The clock is egui's rather than `std`'s,
     /// which panics on `wasm32`.
     pub started_at: f64,
@@ -1448,37 +1524,46 @@ impl Measured for RecoveryJob {
 }
 
 impl RecoveryJob {
-    /// Take the recovery's ending, if it has ended.
-    pub fn take_ended(&self) -> Option<Result<(), Error>> {
+    /// The end of the transcript, rendered for a person to read.
+    pub fn transcript(&self) -> String {
+        console_codec::text(&lock(&self.shared).transcript)
+    }
+
+    /// How many bytes have come off the line in all. See
+    /// [`ConsoleJob::bytes_seen`].
+    pub fn bytes_seen(&self) -> u64 {
+        lock(&self.shared).seen
+    }
+
+    /// Take the job's ending, if it has ended.
+    pub fn take_ended(&self) -> Option<Result<Report, Error>> {
         lock(&self.shared).ended.take()
     }
 }
 
-/// A StarFive recovery made but not yet started.
+/// A StarFive job made but not yet started.
 ///
 /// The counterpart of [`BootstrapWork`] for the serial flow. It holds an opened
-/// [`Serial`] transport, the owned bytes to write, and the consent to write them.
-/// The app spawns it, and a test drives it inline against a scripted serial, as
-/// with [`Work`]. That split makes the recovery wiring testable with neither a
-/// board nor a window.
+/// [`Serial`] transport and the task, which carries the owned bytes and, for a
+/// recovery, the consent to write them. The app spawns it, and a test drives it
+/// inline against a scripted serial, as with [`Work`]. That split makes the wiring
+/// testable with neither a board nor a window.
 ///
 /// It is generic over the seam. The app instantiates it with the native
 /// [`SerialWire`](crate::platform::SerialWire), and a test with a scripted serial.
 pub struct RecoveryWork<S: Serial> {
     serial: S,
-    request: OwnedRecoveryRequest,
-    confirmed: ConfirmedRecovery,
+    task: StarfiveTask,
     shared: Shared<RecoveryPublished>,
     cancel: Cancel,
     wake: Wake,
 }
 
 impl<S: Serial> RecoveryWork<S> {
-    /// Make a recovery job, and the handle the frame loop watches it through.
+    /// Make a StarFive job, and the handle the frame loop watches it through.
     pub(crate) fn new(
         serial: S,
-        request: OwnedRecoveryRequest,
-        confirmed: ConfirmedRecovery,
+        task: StarfiveTask,
         started_at: f64,
         wake: Wake,
     ) -> (Self, RecoveryJob) {
@@ -1486,6 +1571,8 @@ impl<S: Serial> RecoveryWork<S> {
         let cancel = Cancel::new();
 
         let job = RecoveryJob {
+            label: task.label(),
+            writes: matches!(task, StarfiveTask::Recover { .. }),
             started_at,
             cancel: cancel.clone(),
             shared: shared.clone(),
@@ -1493,8 +1580,7 @@ impl<S: Serial> RecoveryWork<S> {
 
         let work = Self {
             serial,
-            request,
-            confirmed,
+            task,
             shared,
             cancel,
             wake,
@@ -1503,36 +1589,62 @@ impl<S: Serial> RecoveryWork<S> {
         (work, job)
     }
 
-    /// Run the recovery and publish what it did.
+    /// Run the job and publish what it did.
     ///
-    /// The serial transport is dropped when this returns, closing the port. There
-    /// is no read-back and no agent to hand back, and the consent the caller
-    /// confirmed states as much. The ending is therefore the outcome alone.
+    /// The serial transport is dropped when this returns, closing the port. A
+    /// RAM-booted U-Boot keeps waiting at its prompt after the host releases the
+    /// line, and the console flow opens it again from there.
     pub async fn run(self) {
         let RecoveryWork {
             mut serial,
-            request,
-            confirmed,
+            task,
             shared,
             cancel,
             wake,
         } = self;
 
-        // The same drop-obligation, so a panic in the recovery leaves a reported
-        // fault rather than a recovery that never ends.
+        // The same drop-obligation, so a panic in the job leaves a reported fault
+        // rather than a job that never ends.
         let guard = EndOnDrop::armed(
             shared.clone(),
             wake,
-            "the recovery thread stopped before it finished",
+            "the serial job's thread stopped before it finished",
         );
 
         let outcome = {
-            let mut publish = |event| {
+            let mut progress = |event| {
                 lock(&shared).progress = Some(event);
                 guard.wake();
             };
-            let request = request.as_request();
-            recovery::recover(&mut serial, &request, confirmed, &mut publish, &cancel).await
+            let mut transcript = |bytes: &[u8]| {
+                lock(&shared).push(bytes);
+                guard.wake();
+            };
+            match task {
+                StarfiveTask::Recover { request, confirmed } => {
+                    let request = request.as_request();
+                    recovery::recover(
+                        &mut serial,
+                        &request,
+                        confirmed,
+                        &mut progress,
+                        &mut transcript,
+                        &cancel,
+                    )
+                    .await
+                    .map(|()| Report::Recovered)
+                }
+                StarfiveTask::RamBoot(boot) => starfive::uart_boot(
+                    &mut serial,
+                    &boot.as_request(),
+                    &boot.prompt,
+                    &mut progress,
+                    &mut transcript,
+                    &cancel,
+                )
+                .await
+                .map(|()| Report::UartBooted),
+            }
         };
 
         guard.finish(move |published| {

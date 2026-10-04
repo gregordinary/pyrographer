@@ -70,8 +70,9 @@ bootloader prompt.
 Neither addresses sectors or carries a partition table, so neither offers the uniform verbs.
 Each has a verb of its own, rather than the uniform set with every verb disabled.
 
-The console connects the USB and serial halves. A maskrom bootstrap loads U-Boot into DRAM over
-USB. The console then instructs that U-Boot, at its own prompt, to answer on the bus.
+The console connects the USB and serial halves. A bootstrap loads U-Boot into DRAM: the Rockchip
+maskrom bootstrap over USB, or the StarFive one over the serial line. The console then instructs
+that U-Boot, at its own prompt, to answer on the bus.
 
 ## Codecs
 

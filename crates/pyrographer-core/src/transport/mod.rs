@@ -229,6 +229,22 @@ pub trait Serial {
     async fn write_all(&mut self, data: &[u8]) -> Result<()>;
 }
 
+/// A borrowed line is a line.
+///
+/// A driver that owns its line by value, such as [`UBoot`](crate::uboot::UBoot),
+/// can then run over a line another driver holds and keeps. The StarFive RAM boot
+/// hands its line to the U-Boot driver this way, to stop the autoboot of the U-Boot
+/// it has just sent.
+impl<S: Serial + ?Sized> Serial for &mut S {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (**self).read(buf).await
+    }
+
+    async fn write_all(&mut self, data: &[u8]) -> Result<()> {
+        (**self).write_all(data).await
+    }
+}
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     //! A transport that replays a scripted conversation, so the backends and verbs

@@ -26,8 +26,13 @@
 //! the same job for an Ingenic XBurst board. Its wire protocol differs: `VR_*`
 //! vendor requests on endpoint 0, a bulk payload, and a two-stage upload. Both
 //! bring a board with nothing usable on flash to a state a flash agent can drive.
+//!
+//! The submodule [`starfive`] RAM-boots a StarFive JH7110 board into U-Boot over
+//! its UART, because the JH7110 BootROM has no USB. It ends at a U-Boot prompt
+//! rather than at a flash agent, and [`uboot`](crate::uboot) takes over there.
 
 pub mod ingenic;
+pub mod starfive;
 
 use crate::codec::rkboot::{self, CHUNK_SIZE, LoaderImage};
 use crate::progress::{Cancel, Progress, ProgressSink};

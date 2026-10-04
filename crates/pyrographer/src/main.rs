@@ -16,10 +16,12 @@ use std::time::Instant;
 use pyrographer_core::agent::{DfuAgent, FlashAgent, RockusbAgent};
 use pyrographer_core::block::{self, BlockDevice};
 use pyrographer_core::bootstrap::ingenic::{IngenicLoader, Stage};
+use pyrographer_core::bootstrap::starfive::{self, UartBootRequest};
 use pyrographer_core::codec::console as console_codec;
 use pyrographer_core::codec::rkboot;
 use pyrographer_core::codec::rkfw;
 use pyrographer_core::codec::rockusb::{ResetMode, StorageMedium};
+use pyrographer_core::codec::splhdr::Origin;
 use pyrographer_core::console::{self, Seen};
 use pyrographer_core::discovery::{self, DeviceInfo, Mode};
 use pyrographer_core::fill::FillReport;
@@ -28,7 +30,7 @@ use pyrographer_core::image::{SyncReader, SyncWriter};
 use pyrographer_core::layout::Layout;
 use pyrographer_core::partition::{Partition, PartitionTable, TableFormat};
 use pyrographer_core::progress::{Cancel, Progress};
-use pyrographer_core::recovery::{self, RecoveryPlan, RecoveryRequest, RecoveryTarget};
+use pyrographer_core::recovery::{self, RecoveryPlan, RecoveryRequest};
 use pyrographer_core::soc::Soc;
 use pyrographer_core::transport::{DEFAULT_BAUD, SerialTransport, UsbTransport};
 use pyrographer_core::uboot::{BootPlan, Gadget, GadgetDevice, UBoot};
@@ -83,8 +85,11 @@ COMMANDS:
     verify <lba> <file>           Compare the flash at <lba> against a file
     reset                         Reboot the connected device, or end its session
                                   another way (see RESET OPTIONS)
-    recover                       Recover a StarFive JH7110 board over a serial
-                                  line (see RECOVER OPTIONS)
+    recover                       Write a StarFive JH7110 board's boot flash over
+                                  a serial line (see RECOVER OPTIONS)
+    uartboot                      Boot a StarFive JH7110 board into U-Boot over a
+                                  serial line, writing nothing (see UARTBOOT
+                                  OPTIONS)
     console                       Watch a serial console for the text that says a
                                   board worked, or that it did not (see CONSOLE
                                   OPTIONS)
@@ -219,18 +224,35 @@ CLONE OPTIONS:
 
 RECOVER OPTIONS (StarFive JH7110, over a serial line):
     --port <path>                 The serial port, e.g. /dev/ttyUSB0 or COM3
-    --target flash|emmc           The boot medium to write to
     --agent <file>                The recovery agent (jh7110-recovery-*.bin)
-    --spl <file>                  A raw u-boot-spl.bin to write (headered here)
-    --uboot <file>                A U-Boot FIT payload to write (sent as-is)
+    --spl <file>                  The SPL to write: u-boot-spl.bin, which is
+                                  headered here, or u-boot-spl.bin.normal.out
+    --uboot <file>                The U-Boot payload to write, sent as-is
     --dry-run                     Show what the recovery would write, and stop
     --yes                         Do not ask for confirmation
 
-    recover writes at least one of --spl or --uboot. The board must be strapped
-    into UART recovery and powered on. Unlike every other write, a StarFive
-    recovery is not read back. The protocol cannot read flash, so only the
-    transfer's own acknowledgment confirms the write. OTP fuse burning is never
-    offered.
+    recover writes the board's QSPI NOR flash: the SPL at 0x0 and U-Boot at
+    0x100000. It writes at least one of --spl or --uboot, and an SPL needs
+    --uboot beside it, because the agent also writes a copy of the SPL inside
+    the U-Boot region. The board must be strapped into UART recovery. recover
+    types at the agent's menu only when the agent asks, and reads the agent's
+    verdict after every file. Unlike every other write, a StarFive recovery is
+    not read back, because the agent cannot read flash. OTP fuse burning is
+    never offered.
+
+UARTBOOT OPTIONS (StarFive JH7110, over a serial line):
+    --port <path>                 The serial port, e.g. /dev/ttyUSB0 or COM3
+    --spl <file>                  A mainline SPL built with
+                                  CONFIG_SPL_YMODEM_SUPPORT: u-boot-spl.bin, or
+                                  u-boot-spl.bin.normal.out
+    --uboot <file>                The u-boot.itb that SPL loads
+    --prompt <text>               U-Boot's prompt (default \"=> \")
+
+    uartboot sends the SPL to the board's BootROM and U-Boot to the SPL, and
+    stops U-Boot at its prompt. Nothing is written to the board, which must be
+    strapped into UART recovery. `uboot --gadget ums` on the same port then hands
+    the board's eMMC to this machine as a disk, and the block-device commands
+    write it with a read-back of every window.
 
 CONSOLE OPTIONS (watch a serial line):
     --port <path>                 The serial port, e.g. /dev/ttyUSB0 or COM3
@@ -263,7 +285,7 @@ UBOOT OPTIONS (drive a bootloader prompt over a serial line):
                                   to the USB side: rockusb answers as a loader in
                                   `list`, and ums (USB mass storage) appears as a
                                   disk in `list --blocks`. This completes the
-                                  RAM-boot that `db` starts.
+                                  RAM-boot that `db` or `uartboot` starts.
     --gadget-dev <if>:<index>     Which block device the gadget exposes (default
                                   mmc:0). Write <controller>:<if>:<index> when the
                                   gadget is not on USB controller 0.
@@ -298,9 +320,10 @@ USBBOOT OPTIONS (Ingenic XBurst boot ROM -> DFU):
     the board re-enumerates as a DFU device (a108:4d44). Run `list` to find it.
     The whole upload sequence is unverified against hardware.
 
-console and uboot take no --device. Name the serial port with --port, as for
-recover. uboot completes the RAM-boot that db starts. db loads a U-Boot into DRAM
-over USB, and the board then answers on its serial port rather than on the bus.
+console, uboot and uartboot take no --device. Name the serial port with --port,
+as for recover. uboot completes the RAM-boot that db or uartboot starts. db loads
+a U-Boot into DRAM over USB, and uartboot over the serial port. Either way the
+board then answers on its serial port rather than on the bus.
 
 Every device-bound command except db and usbboot needs a device in loader mode.
 db needs one in maskrom, and usbboot one in an Ingenic boot ROM. Each of the two
@@ -471,6 +494,7 @@ fn run() -> Run {
         Some("firmware-info") => cmd_firmware_info(args),
         Some("flash-firmware") => cmd_flash_firmware(args),
         Some("recover") => cmd_recover(args),
+        Some("uartboot") => cmd_uartboot(args),
         Some("console") => cmd_console(args),
         Some("uboot") => cmd_uboot(args),
         Some("help") => {
@@ -3280,18 +3304,15 @@ fn cmd_usbboot(mut args: pico_args::Arguments) -> Run {
 ///
 /// A StarFive recovery names a serial port rather than a bus device. There is
 /// nothing to scan, so there is nothing to select with `--device`. It also names
-/// a target medium, the recovery agent to upload, and at least one thing to
-/// write.
+/// the recovery agent to upload, and at least one thing to write.
 #[derive(Debug, PartialEq, Eq)]
 struct RecoverArgs {
     /// The serial port path: `/dev/ttyUSB0`, `COM3`.
     port: String,
-    /// The boot medium both stages are written to.
-    target: RecoveryTarget,
     /// The recovery agent (`jh7110-recovery-*.bin`), uploaded first.
     agent: String,
-    /// A raw `u-boot-spl.bin`, headered here for the target. Optional, but at
-    /// least one of this and `uboot` is required.
+    /// The SPL, raw or headered. Optional, but at least one of this and `uboot`
+    /// is required.
     spl: Option<String>,
     /// A U-Boot FIT payload, sent as-is. Optional, on the same terms as `spl`.
     uboot: Option<String>,
@@ -3301,7 +3322,7 @@ struct RecoverArgs {
     dry_run: bool,
 }
 
-/// Read `recover`'s port, target, and files.
+/// Read `recover`'s port and files.
 ///
 /// A missing or unparsable option is a usage error only. No port has been opened
 /// and no board has been touched. This function also checks that at least one of
@@ -3314,19 +3335,6 @@ fn parse_recover(args: &mut pico_args::Arguments) -> std::result::Result<Recover
     let port: String = args
         .value_from_str("--port")
         .map_err(|e| CliError::Usage(format!("recover needs --port <path>: {e}")))?;
-
-    let target_str: String = args
-        .value_from_str("--target")
-        .map_err(|e| CliError::Usage(format!("recover needs --target flash|emmc: {e}")))?;
-    let target = match target_str.as_str() {
-        "flash" | "nor" => RecoveryTarget::NorFlash,
-        "emmc" => RecoveryTarget::Emmc,
-        other => {
-            return Err(CliError::Usage(format!(
-                "--target is flash or emmc, not '{other}'"
-            )));
-        }
-    };
 
     let agent: String = args.value_from_str("--agent").map_err(|e| {
         CliError::Usage(format!(
@@ -3350,7 +3358,6 @@ fn parse_recover(args: &mut pico_args::Arguments) -> std::result::Result<Recover
 
     Ok(RecoverArgs {
         port,
-        target,
         agent,
         spl,
         uboot,
@@ -3371,7 +3378,6 @@ fn parse_recover(args: &mut pico_args::Arguments) -> std::result::Result<Recover
 fn cmd_recover(mut args: pico_args::Arguments) -> Run {
     let RecoverArgs {
         port,
-        target,
         agent,
         spl,
         uboot,
@@ -3389,7 +3395,6 @@ fn cmd_recover(mut args: pico_args::Arguments) -> Run {
     let uboot_bytes = read_optional(uboot.as_deref())?;
 
     let request = RecoveryRequest {
-        target,
         agent: &agent_bytes,
         spl: spl_bytes.as_deref(),
         uboot: uboot_bytes.as_deref(),
@@ -3412,24 +3417,126 @@ fn cmd_recover(mut args: pico_args::Arguments) -> Run {
     let mut render = ProgressRenderer::new("Sending", "Sent");
     let cancel = Cancel::new();
 
-    pollster::block_on(async {
-        let mut serial = SerialTransport::open(&port)?;
-        recovery::recover(
-            &mut serial,
-            &request,
-            plan.confirm(),
-            &mut |event| render.render(event),
-            &cancel,
-        )
-        .await
-    })?;
+    let mut serial = SerialTransport::open(&port)?;
+    eprintln!("Waiting for the board. Power it on, strapped into UART recovery.");
+    pollster::block_on(recovery::recover(
+        &mut serial,
+        &request,
+        plan.confirm(),
+        &mut |event| render.render(event),
+        &mut echo_console,
+        &cancel,
+    ))?;
 
     println!(
-        "Recovery complete. The transfer was acknowledged, but this board's write \
+        "\nRecovery complete. The agent reported every write as done. This board's write \
          cannot be read back."
     );
     println!("Power off, return the boot strap to normal, and power on.");
     Ok(())
+}
+
+/// What `uartboot` reads off the command line.
+#[derive(Debug, PartialEq, Eq)]
+struct UartbootArgs {
+    /// The serial port path: `/dev/ttyUSB0`, `COM3`.
+    port: String,
+    /// The SPL, raw or headered, built to load U-Boot by YMODEM.
+    spl: String,
+    /// The U-Boot FIT the SPL loads.
+    uboot: String,
+    /// The prompt the U-Boot being sent presents.
+    prompt: String,
+}
+
+/// Read `uartboot`'s port, files and prompt.
+fn parse_uartboot(args: &mut pico_args::Arguments) -> std::result::Result<UartbootArgs, CliError> {
+    let port: String = args
+        .value_from_str("--port")
+        .map_err(|e| CliError::Usage(format!("uartboot needs --port <path>: {e}")))?;
+    let spl: String = args.value_from_str("--spl").map_err(|e| {
+        CliError::Usage(format!(
+            "uartboot needs --spl <file>, an SPL built with CONFIG_SPL_YMODEM_SUPPORT: {e}"
+        ))
+    })?;
+    let uboot: String = args.value_from_str("--uboot").map_err(|e| {
+        CliError::Usage(format!("uartboot needs --uboot <file>, a u-boot.itb: {e}"))
+    })?;
+    let prompt: String = args
+        .opt_value_from_str("--prompt")
+        .map_err(|e| CliError::Usage(format!("--prompt takes the prompt to match: {e}")))?
+        .unwrap_or_else(|| pyrographer_core::uboot::DEFAULT_PROMPT.to_string());
+    Ok(UartbootArgs {
+        port,
+        spl,
+        uboot,
+        prompt,
+    })
+}
+
+/// Boot a StarFive JH7110 board into U-Boot over a serial line, writing nothing.
+///
+/// It is the serial counterpart of `db`: it leaves a full U-Boot running in DRAM,
+/// stopped at its prompt, where `uboot` takes over on the same port. A RAM boot
+/// writes nothing, so it asks for no confirmation, as `db` asks for none.
+fn cmd_uartboot(mut args: pico_args::Arguments) -> Run {
+    let UartbootArgs {
+        port,
+        spl,
+        uboot,
+        prompt,
+    } = parse_uartboot(&mut args)?;
+    no_more(args)?;
+
+    let spl_bytes =
+        std::fs::read(&spl).map_err(|e| Error::Io(format!("cannot read {spl}: {e}")))?;
+    let uboot_bytes =
+        std::fs::read(&uboot).map_err(|e| Error::Io(format!("cannot read {uboot}: {e}")))?;
+    let request = UartBootRequest {
+        spl: &spl_bytes,
+        uboot: &uboot_bytes,
+    };
+
+    let plan = starfive::plan_uart_boot(&request)?;
+    println!(
+        "\nBooting U-Boot in RAM on a StarFive JH7110 board over {port}. Nothing is written to \
+         the board.\n\n  \
+         SPL          {}, sent to the BootROM, {}\n  \
+         U-Boot       {}, sent to the SPL by YMODEM\n",
+        human_bytes(plan.spl_bytes),
+        origin_words(plan.spl_origin),
+        human_bytes(plan.uboot_bytes),
+    );
+
+    let mut render = ProgressRenderer::new("Sending", "Sent");
+    let cancel = Cancel::new();
+    let mut serial = SerialTransport::open(&port)?;
+    eprintln!("Waiting for the board. Power it on, strapped into UART recovery.");
+    pollster::block_on(starfive::uart_boot(
+        &mut serial,
+        &request,
+        &prompt,
+        &mut |event| render.render(event),
+        &mut echo_console,
+        &cancel,
+    ))?;
+
+    println!(
+        "\nU-Boot is running in RAM, stopped at its prompt. Nothing was written to the board."
+    );
+    println!(
+        "Run `pyrographer uboot --port {port} --gadget ums` to hand its eMMC to this machine as a \
+         disk."
+    );
+    Ok(())
+}
+
+/// How an SPL's header came to be, in the words a plan uses.
+fn origin_words(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Headered => "its header checked",
+        Origin::HeaderedHere => "headered here",
+    }
 }
 
 /// Read a file named by an optional path, keeping the `None` when there is none.
@@ -3444,31 +3551,35 @@ fn read_optional(path: Option<&str>) -> std::result::Result<Option<Vec<u8>>, Cli
 
 /// Render a [`RecoveryPlan`] for a person about to recover a board.
 ///
-/// It names the port and the medium, and what is uploaded and written. It also
-/// states the one fact that sets a StarFive recovery apart from every other
-/// write: it is not read back. The protocol cannot read flash, so the plan states
-/// that plainly, as a warning.
+/// It names the port, and what is uploaded and written where. It says where the
+/// SPL's backup copy lands. It also states the one fact that sets a StarFive
+/// recovery apart from every other write: it is not read back. The protocol
+/// cannot read flash, so the plan states that plainly, as a warning.
 fn render_recovery_plan(port: &str, plan: &RecoveryPlan) -> String {
-    let medium = match plan.target {
-        RecoveryTarget::NorFlash => "QSPI NOR flash",
-        RecoveryTarget::Emmc => "eMMC",
-    };
-
     let mut out = format!(
         "\n\
-         This will recover a StarFive JH7110 board over {port}, writing to {medium}.\n\
+         This will write the boot flash of a StarFive JH7110 board over {port}.\n\
          \n  \
-         agent        {} (uploaded into SRAM first)\n",
+         agent        {}, sent to the BootROM first\n",
         human_bytes(plan.agent_bytes),
     );
 
     for stage in &plan.stages {
+        let origin = match stage.origin {
+            Some(origin) => format!(", {}", origin_words(origin)),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "  {:<12} {} (agent menu option {}, to {medium})\n",
+            "  {:<12} {} at {:#x}, agent menu entry {}{origin}\n",
             stage.kind.name(),
             human_bytes(stage.image_bytes),
+            stage.offset,
             stage.menu_option,
         ));
+    }
+
+    if let Some(backup) = plan.describe_backup() {
+        out.push_str(&format!("\n{backup}\n"));
     }
 
     if !plan.verified {
@@ -3476,7 +3587,8 @@ fn render_recovery_plan(port: &str, plan: &RecoveryPlan) -> String {
             "\n\
              Warning: this write is not read back. The recovery protocol cannot read\n\
              flash. Each block's acknowledgment confirms that the board received it,\n\
-             not that the flash holds it.\n",
+             and the agent's verdict that its write finished, not that the flash\n\
+             holds it.\n",
         );
     }
     out.push_str("Nothing here can be undone.\n");
@@ -4523,6 +4635,7 @@ mod tests {
     use super::*;
     use pyrographer_core::agent::FlashInfo;
     use pyrographer_core::agent::ReadBack;
+    use pyrographer_core::codec::splhdr::Origin;
     use pyrographer_core::partition::{Overlap, Partition, TableFormat, TableRecovery};
     use pyrographer_core::recovery::{PlannedStage, StageKind};
     use pyrographer_core::verbs::Segment;
@@ -5919,16 +6032,14 @@ mod tests {
         no_more(args).expect("nothing is left over");
     }
 
-    /// A recovery names a port, and then what to send where: a medium, an agent,
-    /// and at least one thing to write. It selects no bus device, because there
-    /// is nothing to scan. A serial port is a path, not a device on a bus.
+    /// A recovery names a port, an agent, and at least one thing to write. It
+    /// selects no bus device, because there is nothing to scan. A serial port is a
+    /// path, not a device on a bus.
     #[test]
-    fn recover_reads_its_port_target_agent_and_files() {
+    fn recover_reads_its_port_agent_and_files() {
         let args = parse_recover(&mut arguments(&[
             "--port",
             "/dev/ttyUSB0",
-            "--target",
-            "flash",
             "--agent",
             "recovery.bin",
             "--spl",
@@ -5942,7 +6053,6 @@ mod tests {
             args,
             RecoverArgs {
                 port: "/dev/ttyUSB0".to_string(),
-                target: RecoveryTarget::NorFlash,
                 agent: "recovery.bin".to_string(),
                 spl: Some("spl.bin".to_string()),
                 uboot: Some("u-boot.itb".to_string()),
@@ -5951,12 +6061,12 @@ mod tests {
             }
         );
 
-        // eMMC is the other medium, and one stage alone is a valid recovery.
+        // One stage alone parses. Whether it is a valid recovery is the plan's
+        // call, which looks at the files.
         let args = parse_recover(&mut arguments(&[
-            "--port", "COM3", "--target", "emmc", "--agent", "a.bin", "--uboot", "u.itb",
+            "--port", "COM3", "--agent", "a.bin", "--uboot", "u.itb",
         ]))
-        .expect("a U-Boot-only recovery to eMMC");
-        assert_eq!(args.target, RecoveryTarget::Emmc);
+        .expect("a U-Boot-only recovery");
         assert_eq!(args.spl, None);
         assert_eq!(args.uboot.as_deref(), Some("u.itb"));
     }
@@ -5968,8 +6078,6 @@ mod tests {
         let error = parse_recover(&mut arguments(&[
             "--port",
             "/dev/ttyUSB0",
-            "--target",
-            "flash",
             "--agent",
             "recovery.bin",
         ]))
@@ -5981,43 +6089,51 @@ mod tests {
         assert!(message.contains("--spl or --uboot"), "{message}");
     }
 
-    /// A target that is not one of the two media is a usage error. The tool does
-    /// not guess which medium a person meant, because a wrong guess bricks a
-    /// board.
+    /// `recover` writes the boot flash and takes no medium. A `--target` left over
+    /// from habit is not read, and is refused as an argument nothing used rather
+    /// than ignored.
     #[test]
-    fn a_recover_target_that_is_not_a_medium_is_a_usage_problem() {
-        let error = parse_recover(&mut arguments(&[
+    fn a_recover_target_is_not_an_option() {
+        let mut args = arguments(&[
             "--port",
             "/dev/ttyUSB0",
             "--target",
-            "sd",
+            "emmc",
             "--agent",
             "recovery.bin",
-            "--spl",
-            "spl.bin",
-        ]))
-        .expect_err("'sd' is not a recovery medium");
-        assert!(matches!(error, CliError::Usage(_)), "{error:?}");
+            "--uboot",
+            "u-boot.itb",
+        ]);
+        parse_recover(&mut args).expect("the options recover does take");
+        assert!(no_more(args).is_err(), "--target is left over, and refused");
     }
 
     /// Every other write is read back, and a StarFive recovery cannot be. The
-    /// plan a person confirms must say so plainly. It also names the port, the
-    /// medium, and what each stage writes.
+    /// plan a person confirms must say so plainly. It also names the port, and
+    /// where each stage goes and under which menu entry.
     #[test]
-    fn the_recovery_plan_says_the_write_is_not_read_back() {
+    fn the_recovery_plan_says_where_each_stage_goes_and_that_it_is_not_read_back() {
         let plan = RecoveryPlan {
-            target: RecoveryTarget::Emmc,
-            agent_bytes: 40 * 1024,
+            agent_bytes: 160 * 1024,
+            agent_crc32: 0,
             stages: vec![
                 PlannedStage {
                     kind: StageKind::Spl,
-                    menu_option: 1,
+                    menu_option: 0,
                     image_bytes: 128 * 1024,
+                    offset: 0,
+                    backup_offset: Some(0x20_0000),
+                    origin: Some(Origin::HeaderedHere),
+                    crc32: 0,
                 },
                 PlannedStage {
                     kind: StageKind::UBoot,
-                    menu_option: 3,
+                    menu_option: 2,
                     image_bytes: 3 * 1024 * 1024,
+                    offset: 0x10_0000,
+                    backup_offset: None,
+                    origin: None,
+                    crc32: 0,
                 },
             ],
             verified: false,
@@ -6026,14 +6142,18 @@ mod tests {
         let rendered = render_recovery_plan("/dev/ttyUSB0", &plan);
 
         assert!(rendered.contains("/dev/ttyUSB0"), "the port: {rendered}");
-        assert!(rendered.contains("eMMC"), "the medium: {rendered}");
+        assert!(rendered.contains("boot flash"), "the medium: {rendered}");
         assert!(
-            rendered.contains("SPL") && rendered.contains("menu option 1"),
+            rendered.contains("at 0x0, agent menu entry 0, headered here"),
             "the SPL stage: {rendered}"
         );
         assert!(
-            rendered.contains("U-Boot") && rendered.contains("menu option 3"),
+            rendered.contains("at 0x100000, agent menu entry 2"),
             "the U-Boot stage: {rendered}"
+        );
+        assert!(
+            rendered.contains("backup copy of the SPL at 0x200000"),
+            "where the backup copy lands: {rendered}"
         );
         assert!(
             rendered.contains("Warning: this write is not read back"),
@@ -6043,6 +6163,34 @@ mod tests {
             rendered.contains("Nothing here can be undone"),
             "and what it costs: {rendered}"
         );
+    }
+
+    /// A RAM boot names a port and both files, and the prompt defaults to
+    /// mainline's.
+    #[test]
+    fn uartboot_reads_its_port_files_and_prompt() {
+        let args = parse_uartboot(&mut arguments(&[
+            "--port",
+            "/dev/ttyUSB0",
+            "--spl",
+            "u-boot-spl.bin.normal.out",
+            "--uboot",
+            "u-boot.itb",
+        ]))
+        .expect("a valid RAM boot");
+        assert_eq!(
+            args,
+            UartbootArgs {
+                port: "/dev/ttyUSB0".to_string(),
+                spl: "u-boot-spl.bin.normal.out".to_string(),
+                uboot: "u-boot.itb".to_string(),
+                prompt: "=> ".to_string(),
+            }
+        );
+
+        let error = parse_uartboot(&mut arguments(&["--port", "/dev/ttyUSB0", "--spl", "s"]))
+            .expect_err("no U-Boot");
+        assert!(matches!(error, CliError::Usage(_)), "{error:?}");
     }
 
     /// Core's hints name an action, because the window shows them too. Keyed on

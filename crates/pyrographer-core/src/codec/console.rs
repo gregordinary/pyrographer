@@ -195,6 +195,16 @@ impl Console {
         self.compact();
     }
 
+    /// Advance the cursor past everything pushed so far.
+    ///
+    /// The bytes stay in the transcript, and no later search finds them. A caller
+    /// uses it after handling a stretch of the stream by other means. The XMODEM
+    /// sender does, with the control bytes of a transfer.
+    pub fn skip_to_end(&mut self) {
+        self.cursor = self.stream_len();
+        self.compact();
+    }
+
     /// What lay between the cursor and a match: a command's output, between the
     /// echo of the command and the prompt that follows it.
     pub fn before(&self, found: &Match) -> &[u8] {
@@ -357,6 +367,25 @@ mod tests {
             second.start > first.end,
             "the second prompt is a later one, not the first found again"
         );
+    }
+
+    /// Skipping to the end hides everything pushed so far from the next search, and
+    /// keeps it in the transcript. Bytes pushed afterward are found as usual.
+    #[test]
+    fn skipping_to_the_end_hides_what_was_pushed_and_keeps_the_transcript() {
+        let mut console = Console::new();
+        console.push(b"CCCC\x06\x06");
+        console.skip_to_end();
+        assert!(console.find(&[b"CCCC"]).is_none(), "behind the cursor now");
+        assert_eq!(
+            console.transcript(),
+            b"CCCC\x06\x06",
+            "still in the transcript"
+        );
+
+        console.push(b"CCCC");
+        let found = console.find(&[b"CCCC"]).expect("a later run");
+        assert_eq!(found.start, 6);
     }
 
     /// The earliest occurrence wins, whatever order the patterns are listed in. A

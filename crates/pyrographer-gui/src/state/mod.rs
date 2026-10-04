@@ -19,8 +19,8 @@ mod job;
 
 pub use job::{
     Aim, BootstrapJob, BootstrapWork, ConsoleJob, ConsoleReport, ConsoleTask, ConsoleWork, Ended,
-    IngenicBootstrapWork, Job, LayoutSource, Measured, Outcome, OwnedRecoveryRequest, RecoveryJob,
-    RecoveryWork, Report, Stoppable, Task, Work,
+    IngenicBootstrapWork, Job, LayoutSource, Measured, Outcome, OwnedRecoveryRequest,
+    OwnedUartBoot, RecoveryJob, RecoveryWork, Report, StarfiveTask, Stoppable, Task, Work,
 };
 
 pub(crate) use crate::platform::lock;
@@ -29,11 +29,12 @@ use pyrographer_core::Error;
 use pyrographer_core::agent::{Caps, FlashAgent, FlashInfo};
 use pyrographer_core::block::BlockDevice;
 use pyrographer_core::bootstrap::ingenic::IngenicLoader;
+use pyrographer_core::bootstrap::starfive;
 use pyrographer_core::codec::ingenic_boot::CpuInfo;
 use pyrographer_core::codec::rkboot::LoaderImage;
 use pyrographer_core::discovery::DeviceInfo;
 use pyrographer_core::partition::PartitionTable;
-use pyrographer_core::recovery::{self, ConfirmedRecovery, RecoveryPlan, RecoveryTarget};
+use pyrographer_core::recovery::{self, ConfirmedRecovery, RecoveryPlan};
 use pyrographer_core::soc::Soc;
 use pyrographer_core::transport::{Serial, Transport};
 use pyrographer_core::uboot::{BootPlan, ConfirmedBoot};
@@ -615,26 +616,33 @@ impl RecoveryPending {
     }
 }
 
-/// The StarFive recovery flow's state: the files it would write, a plan waiting to
-/// be agreed to, and the recovery in flight.
+/// The StarFive flow's state: the files it would send, a recovery plan waiting to
+/// be agreed to, and the job in flight.
 ///
 /// It is one struct because it is one flow, the serial one, beside the USB flow's
 /// state on [`Session`]. The files are held as [`Session::image`] is: picked once,
-/// and read when the recovery runs. A recovery blob is small, so it is held whole
-/// rather than behind a handle.
+/// and read when the job runs. A recovery blob is small, so it is held whole
+/// rather than behind a handle. The same SPL and U-Boot serve both of the flow's
+/// jobs: a recovery writes them to flash through the agent, and a RAM boot runs
+/// them without the agent and writes nothing.
 #[derive(Default)]
 pub struct Recovery {
-    /// The recovery agent (`jh7110-recovery-*.bin`), uploaded first. Required.
+    /// The recovery agent (`jh7110-recovery-*.bin`), uploaded first. A recovery
+    /// needs it, and a RAM boot does not.
     pub agent: Option<PickedBlob>,
-    /// A raw `u-boot-spl.bin`. Optional, but at least one of this and
-    /// [`uboot`](Self::uboot) is needed for a recovery to write anything.
+    /// The SPL, as `u-boot-spl.bin` or `u-boot-spl.bin.normal.out`. A recovery
+    /// needs at least one of this and [`uboot`](Self::uboot), and a RAM boot needs
+    /// both.
     pub spl: Option<PickedBlob>,
-    /// A U-Boot FIT payload. Optional, on the same terms as `spl`.
+    /// A U-Boot FIT payload, on the same terms as `spl`.
     pub uboot: Option<PickedBlob>,
     /// A recovery plan waiting to be agreed to.
     pub pending: Option<RecoveryPending>,
-    /// The recovery in flight, if there is one.
+    /// The job in flight, if there is one.
     pub job: Option<RecoveryJob>,
+    /// What the board printed during the last job, kept after it ends. The
+    /// agent's own words are the best account of a write that failed.
+    pub transcript: String,
 }
 
 impl Recovery {
@@ -1069,7 +1077,7 @@ impl<T: Transport> Session<T> {
     /// It refuses up front what it can. A recovery with no port, no agent, or
     /// neither an SPL nor a U-Boot is refused. The plan and the port are remembered
     /// together, because the confirmation is typed against the port.
-    pub fn plan_recovery(&mut self, port: String, target: RecoveryTarget) -> Result<(), Error> {
+    pub fn plan_recovery(&mut self, port: String) -> Result<(), Error> {
         let port = port.trim().to_string();
         if port.is_empty() {
             return Err(Error::InvalidRequest(
@@ -1085,7 +1093,6 @@ impl<T: Transport> Session<T> {
         // `plan_recover` is what refuses a recovery that writes neither an SPL nor
         // a U-Boot, so that check is not duplicated here.
         let request = recovery::RecoveryRequest {
-            target,
             agent: &agent.bytes,
             spl: self.recovery.spl.as_ref().map(|blob| blob.bytes.as_slice()),
             uboot: self
@@ -1141,35 +1148,62 @@ impl<T: Transport> Session<T> {
         let uboot = self.recovery.uboot.as_ref().map(|blob| blob.bytes.clone());
 
         let pending = self.recovery.pending.take()?;
-        let request = OwnedRecoveryRequest {
-            target: pending.plan.target,
-            agent,
-            spl,
-            uboot,
-        };
+        let request = OwnedRecoveryRequest { agent, spl, uboot };
         Some((pending.port, request, pending.plan.confirm()))
     }
 
-    /// Make a recovery job over an opened serial port.
+    /// The files a RAM boot sends, checked and owned for the job.
+    ///
+    /// A RAM boot writes nothing, so it has no plan screen and no confirmation, as
+    /// a maskrom upload has none. What it does have is the same check of its files
+    /// a recovery's plan makes, here, before the port is opened: an SPL and a U-Boot
+    /// given in each other's place are refused. `prompt` is the prompt of the U-Boot
+    /// being sent, where the job stops it.
+    pub fn prepare_ram_boot(&self, port: &str, prompt: &str) -> Result<OwnedUartBoot, Error> {
+        if port.trim().is_empty() {
+            return Err(Error::InvalidRequest(
+                "name the serial port the board is on, for example /dev/ttyUSB0".to_string(),
+            ));
+        }
+        let (Some(spl), Some(uboot)) = (&self.recovery.spl, &self.recovery.uboot) else {
+            return Err(Error::InvalidRequest(
+                "a RAM boot sends an SPL and a U-Boot payload. Choose both".to_string(),
+            ));
+        };
+        starfive::plan_uart_boot(&starfive::UartBootRequest {
+            spl: &spl.bytes,
+            uboot: &uboot.bytes,
+        })?;
+        Ok(OwnedUartBoot {
+            spl: spl.bytes.clone(),
+            uboot: uboot.bytes.clone(),
+            prompt: prompt.to_string(),
+        })
+    }
+
+    /// Make a StarFive job over an opened serial port.
     ///
     /// The serial counterpart of [`start_bootstrap`](Self::start_bootstrap). It
-    /// takes an opened [`Serial`] transport rather than lending an agent, because a
-    /// recovery holds no [`FlashAgent`] and hands none back. `None` when a recovery
-    /// is already running, and the transport it was handed is then dropped, closing
-    /// the port. A USB job can run alongside a recovery, because they use different
-    /// transports on different flows and do not contend.
+    /// takes an opened [`Serial`] transport rather than lending an agent, because
+    /// the job holds no [`FlashAgent`] and hands none back. `None` when a StarFive
+    /// job is already running, and the transport it was handed is then dropped,
+    /// closing the port. A USB job can run alongside one, because they use
+    /// different transports on different flows and do not contend.
+    ///
+    /// Starting a job clears the transcript the last one left, because a transcript
+    /// holding two jobs reads as one.
     pub fn start_recovery<S: Serial + 'static>(
         &mut self,
         serial: S,
-        request: OwnedRecoveryRequest,
-        confirmed: ConfirmedRecovery,
+        task: StarfiveTask,
         now: f64,
         wake: Wake,
     ) -> Option<RecoveryWork<S>> {
         if self.recovery.job.is_some() {
             return None;
         }
-        let (work, job) = RecoveryWork::new(serial, request, confirmed, now, wake);
+        self.recovery.transcript.clear();
+        let (work, job) = RecoveryWork::new(serial, task, now, wake);
         self.recovery.job = Some(job);
         Some(work)
     }
@@ -1515,12 +1549,13 @@ impl<T: Transport> Session<T> {
         true
     }
 
-    /// Take back a finished recovery, if it has finished.
+    /// Take back a finished StarFive job, if it has finished.
     ///
     /// As with [`harvest_bootstrap`](Self::harvest_bootstrap), there is no agent
-    /// to restore, so this only reports the outcome. The port is dropped. If the
-    /// recovery worked, the board needs to be powered off and re-strapped rather
-    /// than addressed again. The picked files are kept, because a person
+    /// to restore, so this reports the outcome and keeps the transcript. The port
+    /// is dropped. After a recovery, the board needs to be powered off and
+    /// re-strapped rather than addressed again. After a RAM boot, U-Boot waits at
+    /// its prompt for the console flow. The picked files are kept, because a person
     /// recovering a second board uses the same agent and payloads.
     pub fn harvest_recovery(&mut self) -> bool {
         let Some(job) = &self.recovery.job else {
@@ -1529,8 +1564,11 @@ impl<T: Transport> Session<T> {
         let Some(outcome) = job.take_ended() else {
             return false;
         };
+        // Taken before the job is dropped: the agent's own words are the best
+        // account of a write that failed.
+        self.recovery.transcript = job.transcript();
         self.recovery.job = None;
-        self.last = Some(outcome.map(|()| Report::Recovered));
+        self.last = Some(outcome);
         true
     }
 
@@ -1601,6 +1639,7 @@ impl<T: Transport> Session<T> {
             | Report::Bootstrapped { .. }
             | Report::IngenicBootstrapped(_)
             | Report::Recovered
+            | Report::UartBooted
             | Report::TableWritten { .. }
             | Report::FirmwareWritten { .. } => {}
         }

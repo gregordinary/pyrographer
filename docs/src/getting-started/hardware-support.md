@@ -71,8 +71,10 @@ Writing is built, and refused until an Ingenic SoC is pinned against real hardwa
 
 ## StarFive JH7110
 
-`recover` is `[UNVERIFIED]`. The ROM's timing, the block size the recovery agent takes, and the
-newline its menu expects are all unsettled.
+`recover` and `uartboot` are `[UNVERIFIED]`, because no JH7110 board has run them. How the
+recovery agent reads its menu, and what it prints, are read from the agent's own code. The
+BootROM's handshake timing is unsettled. So is whether U-Boot's mass-storage gadget enumerates
+through a Mars CM carrier's USB port.
 
 ## Block devices
 

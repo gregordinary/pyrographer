@@ -27,8 +27,9 @@ pyrographer supports three SoC families, and block devices on Linux:
 
 - **Rockchip**, over USB. Reading is verified on a real RK3576, byte for byte against
   rkdeveloptool, Rockchip's own tool.
-- **StarFive JH7110**, over serial. pyrographer writes a bootloader through the SoC's UART
-  recovery mode. That mode cannot read flash, so the write is not read back.
+- **StarFive JH7110**, over serial. pyrographer writes the boot flash through the SoC's UART
+  recovery mode. That mode cannot read flash, so the write is not read back. pyrographer can also
+  boot U-Boot in RAM over the same line, which hands the eMMC to the block-device commands.
 - **Ingenic XBurst**, over USB. These SoCs are found in IP cameras such as the Wyze Cam v3.
   pyrographer brings the boot ROM up to DFU, then reads the device's flash. Writing is built,
   and refused until an Ingenic SoC is pinned against real hardware.
@@ -61,11 +62,12 @@ partition images, the GPT its parameter describes, and the ID block. `write-idb`
 block alone, the first stage the BootROM reads. Both writes use the same gate and read-back as
 `flash`.
 
-Three commands serve one vendor each:
+Four commands serve one vendor each:
 
 - `db` uploads a loader to a Rockchip board in maskrom, the BootROM's USB download mode.
 - `usbboot` uploads two stages to an Ingenic boot ROM, which brings the device up in DFU.
-- `recover` writes a bootloader to a StarFive board over serial.
+- `recover` writes a bootloader to a StarFive board's flash over serial.
+- `uartboot` boots a StarFive board into U-Boot over serial, and writes nothing.
 
 Two commands work with a board's bootloader prompt over a serial line:
 

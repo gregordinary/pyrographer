@@ -22,9 +22,11 @@
 //! pass, checks it, and hands the verbs what a write of it needs.
 //!
 //! Two serial drivers have no `FlashAgent`. [`recovery`] is StarFive's write-only
-//! recovery, with a verb of its own. [`console`] watches a serial console, and
-//! [`uboot`] drives a U-Boot prompt through it. That prompt is where a maskrom
-//! bootstrap hands off.
+//! recovery, with a verb of its own, and [`modem`] is the XMODEM and YMODEM sender
+//! under it. [`console`] watches a serial console, and [`uboot`] drives a U-Boot
+//! prompt through it. That prompt is where a bootstrap that RAM-boots U-Boot hands
+//! off: the Rockchip maskrom bootstrap over USB, and the StarFive one over the
+//! serial line.
 //!
 //! Core never prints and never reads a clock, so every front-end uses it unchanged,
 //! and so does a test harness. A long operation emits [`progress`] events and takes
@@ -84,6 +86,7 @@ pub mod fill;
 pub mod firmware;
 pub mod image;
 pub mod layout;
+pub mod modem;
 pub mod partition;
 pub mod progress;
 pub mod recovery;

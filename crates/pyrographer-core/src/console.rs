@@ -109,9 +109,9 @@ pub struct Watched {
 
 /// Read from `serial` into `console` until one of `patterns` appears.
 ///
-/// It generalizes the loop in `recovery::wait_for_crc_request`. It searches first,
-/// because the bytes that answer this wait can arrive while the previous wait is
-/// still being satisfied. It then spends one read of the budget, and searches again.
+/// It searches first, because the bytes that answer this wait can arrive while the
+/// previous wait is still being satisfied. It then spends one read of the budget,
+/// and searches again.
 /// A read that timed out is silence, not a failure: it costs one read, and the loop
 /// continues. Every byte read goes to `sink` as it arrives.
 ///
@@ -177,6 +177,71 @@ pub async fn look_for<S: Serial>(
     // The last read's bytes have not been searched yet: the budget counts reads,
     // not searches.
     Ok(console.find(patterns))
+}
+
+/// How long a wait lasts against a far end that prints while it works.
+///
+/// A budget of reads suits a far end that answers and then falls quiet. It does not
+/// suit one that prints all the way through a long job. A recovery agent writing
+/// flash prints a dot per page, and a board coming up prints banner after banner.
+/// Each burst of output costs a read, so a read budget runs out while the far end
+/// is plainly still working.
+///
+/// This wait is measured in silence instead. A read that returns bytes costs
+/// nothing, and the wait ends after [`silent_reads`](Self::silent_reads) reads in a
+/// row return none. A far end that is printing is working, and one that has gone
+/// quiet for that long has stopped. A far end that never falls quiet is bounded by
+/// [`max_bytes`](Self::max_bytes), so the wait still ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Patience {
+    /// How many reads in a row can come back empty before the wait ends.
+    pub silent_reads: u32,
+    /// How many bytes the far end can send before the wait ends anyway.
+    pub max_bytes: u64,
+}
+
+/// Read from `serial` into `console` until one of `patterns` appears, for as long
+/// as the far end keeps talking.
+///
+/// It is [`look_for`] with the budget [`Patience`] describes in place of a count of
+/// reads. It returns `Ok(None)` when the far end has been silent for
+/// [`Patience::silent_reads`] reads in a row, or has sent [`Patience::max_bytes`]
+/// with no match. Every byte read goes to `sink` as it arrives.
+pub async fn look_for_patiently<S: Serial>(
+    serial: &mut S,
+    console: &mut Console,
+    patterns: &[&[u8]],
+    patience: Patience,
+    sink: ConsoleSink<'_>,
+    cancel: &Cancel,
+) -> Result<Option<Match>> {
+    let mut buf = [0u8; READ_CHUNK];
+    let mut silent = 0;
+    let mut received: u64 = 0;
+
+    loop {
+        if let Some(found) = console.find(patterns) {
+            return Ok(Some(found));
+        }
+        if silent >= patience.silent_reads || received >= patience.max_bytes {
+            return Ok(None);
+        }
+        if cancel.is_canceled() {
+            return Err(Error::Canceled);
+        }
+        match serial.read(&mut buf).await {
+            // A read is meant to report silence as a timeout. One that returns no
+            // bytes is silence all the same, and counts as such.
+            Ok(0) | Err(Error::Timeout { .. }) => silent += 1,
+            Ok(n) => {
+                silent = 0;
+                received += n as u64;
+                sink(&buf[..n]);
+                console.push(&buf[..n]);
+            }
+            Err(other) => return Err(other),
+        }
+    }
 }
 
 /// Watch a console for the patterns that mean it worked, and the ones that mean
@@ -452,5 +517,76 @@ mod tests {
         let mut serial = ScriptedSerial::new(vec![SerialStep::ExpectTx(b"printenv\r".to_vec())]);
         pollster::block_on(send_line(&mut serial, "printenv")).expect("it went out");
         serial.assert_drained();
+    }
+
+    /// Run a patient wait for `pattern` against a scripted line.
+    fn run_patiently(steps: Vec<SerialStep>, patience: Patience) -> Result<Option<Match>> {
+        let mut serial = ScriptedSerial::new(steps);
+        let mut console = Console::new();
+        let result = pollster::block_on(look_for_patiently(
+            &mut serial,
+            &mut console,
+            &[b"updata success"],
+            patience,
+            &mut |_| {},
+            &Cancel::new(),
+        ));
+        serial.assert_drained();
+        result
+    }
+
+    /// A far end that keeps printing keeps the wait open. Here it prints more
+    /// bursts than the silence allowance, with a quiet read between some of them,
+    /// and the pattern still arrives. A budget of reads would have run out on the
+    /// dots.
+    #[test]
+    fn a_far_end_that_keeps_printing_is_waited_for() {
+        let mut steps = vec![SerialStep::Rx(b"updata first section\r\n".to_vec())];
+        for _ in 0..10 {
+            steps.push(SerialStep::Rx(b"....".to_vec()));
+            steps.push(SerialStep::Timeout);
+        }
+        steps.push(SerialStep::Rx(b"\r\nupdata success\r\n".to_vec()));
+        let patience = Patience {
+            silent_reads: 2,
+            max_bytes: 4096,
+        };
+        let found = run_patiently(steps, patience).expect("no failure");
+        assert!(
+            found.is_some(),
+            "the verdict arrived while the far end was busy"
+        );
+    }
+
+    /// Silence ends the wait. After the allowance of quiet reads in a row, the wait
+    /// returns no match, and reads no further.
+    #[test]
+    fn silence_in_a_row_ends_a_patient_wait() {
+        let steps = vec![
+            SerialStep::Rx(b"updata first section".to_vec()),
+            SerialStep::Timeout,
+            SerialStep::Timeout,
+            SerialStep::Timeout,
+        ];
+        let patience = Patience {
+            silent_reads: 3,
+            max_bytes: 4096,
+        };
+        assert_eq!(run_patiently(steps, patience).expect("no failure"), None);
+    }
+
+    /// A far end that never falls quiet still ends the wait, once it has sent the
+    /// most bytes the wait allows.
+    #[test]
+    fn a_far_end_that_never_falls_quiet_is_bounded_by_bytes() {
+        let steps = vec![
+            SerialStep::Rx(vec![b'.'; 64]),
+            SerialStep::Rx(vec![b'.'; 64]),
+        ];
+        let patience = Patience {
+            silent_reads: 2,
+            max_bytes: 128,
+        };
+        assert_eq!(run_patiently(steps, patience).expect("no failure"), None);
     }
 }

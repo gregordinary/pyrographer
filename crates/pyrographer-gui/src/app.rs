@@ -35,7 +35,6 @@ use crate::ui;
 // chooser hands back.
 use crate::state::{ConsoleLine, ConsoleTask};
 use pyrographer_core::console;
-use pyrographer_core::recovery::RecoveryTarget;
 use pyrographer_core::uboot::{Gadget, GadgetDevice};
 
 /// How this build asks somebody to confirm a write.
@@ -240,12 +239,12 @@ impl Default for AuthorForm {
     }
 }
 
-/// What has been typed into the StarFive recovery form.
+/// What has been typed into the StarFive form.
 ///
 /// The serial flow's counterpart of [`Form`]. The picked files live on the
-/// session's recovery state, as the image does. This form holds the two small
-/// things entered with them: which serial port the board is on, and which boot
-/// medium to write.
+/// session's recovery state, as the image does. This form holds the one small
+/// thing entered with them: which serial port the board is on.
+#[derive(Default)]
 pub struct RecoverForm {
     /// What the port is called: natively the path somebody typed, and in a tab
     /// the name [`platform::port_name`] gives the object a chooser handed back.
@@ -255,17 +254,6 @@ pub struct RecoverForm {
     /// [`PortHandle`](platform::PortHandle), which natively is this same string and
     /// in a tab is the object.
     pub port: String,
-    /// The boot medium both stages are written to.
-    pub target: RecoveryTarget,
-}
-
-impl Default for RecoverForm {
-    fn default() -> Self {
-        Self {
-            port: String::new(),
-            target: RecoveryTarget::NorFlash,
-        }
-    }
 }
 
 /// What has been typed into the serial console form.
@@ -476,13 +464,9 @@ pub enum IngenicStageKind {
 ///
 /// [`ConfirmedRecovery`]: pyrographer_core::recovery::ConfirmedRecovery
 pub enum PendingSerial {
-    /// A StarFive recovery, with the files it writes and the plan's confirmation.
-    Recovery {
-        /// The agent, and whichever of the SPL and U-Boot payload were chosen.
-        request: crate::state::OwnedRecoveryRequest,
-        /// The plan, confirmed.
-        confirmed: pyrographer_core::recovery::ConfirmedRecovery,
-    },
+    /// A StarFive job: a recovery, with the files it writes and the plan's
+    /// confirmation, or a RAM boot, which writes nothing.
+    Starfive(crate::state::StarfiveTask),
     /// A console session: a watch, a gadget, a typed line, a boot plan, or a
     /// boot override that has already been confirmed.
     Console {
@@ -498,7 +482,12 @@ impl PendingSerial {
     /// What to call the work in a fault report, for an open that never answers.
     fn what(&self) -> &'static str {
         match self {
-            PendingSerial::Recovery { .. } => "opening the port for a recovery",
+            PendingSerial::Starfive(crate::state::StarfiveTask::Recover { .. }) => {
+                "opening the port for a recovery"
+            }
+            PendingSerial::Starfive(crate::state::StarfiveTask::RamBoot(_)) => {
+                "opening the port for a RAM boot"
+            }
             PendingSerial::Console { .. } => "opening the port for a console session",
         }
     }
@@ -1882,11 +1871,8 @@ impl App {
         // confirmation it was opened for, silently. `collect_bootstrap` reports
         // its own refusal, and these two now say the same thing.
         let started = match pending {
-            PendingSerial::Recovery { request, confirmed } => {
-                match self
-                    .session
-                    .start_recovery(serial, request, confirmed, now, wake)
-                {
+            PendingSerial::Starfive(task) => {
+                match self.session.start_recovery(serial, task, now, wake) {
                     Some(work) => {
                         platform::spawn(move || work.run());
                         true
@@ -1923,7 +1909,7 @@ impl App {
     /// Whether a recovery is running, or its port is still being opened.
     pub fn is_recovering(&self) -> bool {
         self.session.recovery.job.is_some()
-            || matches!(self.pending_serial, Some(PendingSerial::Recovery { .. }))
+            || matches!(self.pending_serial, Some(PendingSerial::Starfive(_)))
     }
 
     /// Pick one of a recovery's files: the agent, the SPL, or the U-Boot payload.
@@ -2004,10 +1990,43 @@ impl App {
             return;
         }
         let port = self.recover.port.clone();
-        let target = self.recover.target;
-        if let Err(error) = self.session.plan_recovery(port, target) {
+        if let Err(error) = self.session.plan_recovery(port) {
             self.failed(error);
         }
+    }
+
+    /// Boot U-Boot in RAM over the StarFive form's port, and stop it at its prompt.
+    ///
+    /// It writes nothing, so it has no plan screen, as a maskrom upload has none.
+    /// Its files are checked before the port is opened. The U-Boot is stopped at
+    /// the prompt the console form names, which is where the console flow takes
+    /// over on the same port.
+    pub fn ram_boot(&mut self) {
+        if self.is_recovering() {
+            return;
+        }
+        let port = match self.port_handle(PortField::Recovery) {
+            Ok(port) => port,
+            Err(error) => {
+                self.failed(error);
+                return;
+            }
+        };
+        let boot = match self
+            .session
+            .prepare_ram_boot(&self.recover.port, &self.console.prompt)
+        {
+            Ok(boot) => boot,
+            Err(error) => {
+                self.failed(error);
+                return;
+            }
+        };
+        self.open_port(
+            port,
+            pyrographer_core::transport::DEFAULT_BAUD,
+            PendingSerial::Starfive(crate::state::StarfiveTask::RamBoot(boot)),
+        );
     }
 
     /// Confirm the recovery plan, and run it.
@@ -2037,7 +2056,7 @@ impl App {
         self.open_port(
             port,
             pyrographer_core::transport::DEFAULT_BAUD,
-            PendingSerial::Recovery { request, confirmed },
+            PendingSerial::Starfive(crate::state::StarfiveTask::Recover { request, confirmed }),
         );
     }
 

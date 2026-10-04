@@ -161,6 +161,31 @@ pub enum Error {
         found: Vec<u8>,
     },
 
+    /// StarFive's recovery agent reported that it failed to write a file.
+    ///
+    /// The agent prints a verdict after every file it writes, and this is the
+    /// failing one. The transfer itself completed. The agent's write routine
+    /// returned an error, or the file was larger than the agent writes. Part of the
+    /// region can be erased or written.
+    AgentWriteFailed {
+        /// What was being written: `"SPL"` or `"U-Boot"`.
+        stage: &'static str,
+        /// The agent's own line, ending in its verdict.
+        said: String,
+    },
+
+    /// StarFive's recovery agent opened its OTP fuse menu, and pyrographer stopped
+    /// sending.
+    ///
+    /// pyrographer never chooses that menu. It is reached by a line that reads
+    /// exactly `4`, so seeing it means the agent read something as typing. Once it
+    /// is open, almost any line the agent reads burns fuses that cannot be restored.
+    /// Nothing more was sent after it appeared.
+    FuseMenuOpened {
+        /// The end of the console transcript, which shows how the menu was reached.
+        transcript: String,
+    },
+
     /// A partition table was found on the flash, and it fails its own CRC or
     /// structural validation.
     ///
@@ -294,6 +319,21 @@ impl Error {
                  tool, then replug the board."
                     .to_string(),
             ),
+            Error::AgentWriteFailed { .. } => Some(
+                "the region the agent was writing can now be partly erased, so the board may not \
+                 boot from flash until a recovery completes. Leave the board strapped into UART \
+                 recovery, power it off and on again, and run the recovery again. If it fails the \
+                 same way, the agent's own line above gives its reason."
+                    .to_string(),
+            ),
+            Error::FuseMenuOpened { .. } => Some(
+                "power the board off now. The agent is waiting for a line at its OTP fuse menu, \
+                 and almost any line it reads burns fuses, which cannot be undone. Do not open a \
+                 terminal on this port while the board is on. pyrographer chooses only the menu \
+                 entries that write flash, by the text the agent prints, so the transcript shows \
+                 how the agent came to read something else. Report it."
+                    .to_string(),
+            ),
             Error::Disconnected | Error::Transport(_) | Error::Timeout { .. } => Some(
                 "the device stopped answering.\n\
                  \n\
@@ -393,6 +433,15 @@ impl fmt::Display for Error {
                  nothing was uploaded",
                 bytes_for_reading(expected),
                 bytes_for_reading(found)
+            ),
+            Error::AgentWriteFailed { stage, said } => write!(
+                f,
+                "the recovery agent reported that writing the {stage} failed. It said: {said}"
+            ),
+            Error::FuseMenuOpened { transcript } => write!(
+                f,
+                "the recovery agent opened its OTP fuse menu, and pyrographer sent nothing more. \
+                 Recent console output:\n{transcript}"
             ),
             Error::CorruptTable { format, detail } => write!(
                 f,

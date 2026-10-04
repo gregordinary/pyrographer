@@ -2,7 +2,9 @@
 
 A board running its on-chip boot code serves no flash commands. The commands on this page upload
 code that does serve them, over the vendor's own download protocol. `db` uploads to a Rockchip
-BootROM, and `usbboot` to an Ingenic boot ROM. Neither command writes flash.
+BootROM, and `usbboot` to an Ingenic boot ROM. Neither command writes flash. A StarFive board's
+BootROM has no USB, and `uartboot` boots it into U-Boot over its serial line instead, as
+[Serial lines](serial.md#booting-a-starfive-board-into-u-boot) describes.
 
 ## Bringing a maskrom board to loader mode
 

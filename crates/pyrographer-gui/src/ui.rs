@@ -39,7 +39,7 @@ use crate::state::{
 };
 
 use crate::app::{PortField, RecoveryFileKind};
-use pyrographer_core::recovery::RecoveryTarget;
+use pyrographer_core::codec::splhdr::Origin;
 
 use crate::app::{IngenicStageKind, MaskromStageKind};
 
@@ -535,14 +535,9 @@ fn job_strip(app: &mut App, ui: &mut egui::Ui) {
                 );
             }
             if let Some(job) = &app.session.recovery.job {
-                running_row(
-                    ui,
-                    Tab::Serial,
-                    "Recovering over serial",
-                    None,
-                    job.is_canceling(),
-                    || job.cancel(),
-                );
+                running_row(ui, Tab::Serial, job.label, None, job.is_canceling(), || {
+                    job.cancel()
+                });
             }
             if let Some(job) = &app.session.console.job {
                 running_row(ui, Tab::Serial, job.label, None, job.is_canceling(), || {
@@ -3356,8 +3351,10 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
     prose(
         ui,
         "The JH7110 BootROM has no USB. Strap the board into UART recovery, connect a USB-serial \
-         adapter, and name its port. Unlike a Rockchip write, this board's write is not read \
-         back, because the recovery protocol cannot read flash.",
+         adapter, and name its port. Then either write the board's QSPI NOR flash through \
+         StarFive's recovery agent, or boot U-Boot in RAM and write nothing. Unlike a Rockchip \
+         write, this board's write is not read back, because the recovery protocol cannot read \
+         flash.",
     );
 
     ui.horizontal(|ui| {
@@ -3369,59 +3366,94 @@ fn recovery_section(app: &mut App, ui: &mut egui::Ui) {
         );
     });
 
-    ui.horizontal(|ui| {
-        ui.label("Target");
-        ui.radio_value(
-            &mut app.recover.target,
-            RecoveryTarget::NorFlash,
-            "QSPI NOR flash",
-        );
-        ui.radio_value(&mut app.recover.target, RecoveryTarget::Emmc, "eMMC")
-            .explain(
-                "eMMC and NOR flash need different SPL headers. Sending one to the other's slot \
-                 leaves the board unable to boot. The header is built for the medium chosen \
-                 here.",
-            );
-    });
-
-    recovery_file_row(app, ui, RecoveryFileKind::Agent, "Recovery agent", true);
+    recovery_file_row(
+        app,
+        ui,
+        RecoveryFileKind::Agent,
+        "Recovery agent",
+        "needed to write flash",
+    );
     recovery_file_row(
         app,
         ui,
         RecoveryFileKind::Spl,
-        "SPL (u-boot-spl.bin)",
-        false,
+        "SPL (u-boot-spl.bin or .normal.out)",
+        "optional",
     );
-    recovery_file_row(app, ui, RecoveryFileKind::Uboot, "U-Boot payload", false);
+    recovery_file_row(
+        app,
+        ui,
+        RecoveryFileKind::Uboot,
+        "U-Boot payload",
+        "optional",
+    );
 
     let has_agent = app.session.recovery.agent.is_some();
-    let has_payload = app.session.recovery.spl.is_some() || app.session.recovery.uboot.is_some();
+    let has_spl = app.session.recovery.spl.is_some();
+    let has_uboot = app.session.recovery.uboot.is_some();
     let has_port = !app.recover.port.trim().is_empty();
-    let can_plan = has_agent && has_payload && has_port && !app.is_recovering();
+    let idle = !app.is_recovering();
 
     ui.add_space(4.0);
-    let plan = ui
-        .add_enabled(can_plan, egui::Button::new("Plan recovery..."))
-        .explain_disabled(
-            "Name the port, choose the recovery agent, and choose at least one of an SPL or a \
-             U-Boot payload to write.",
-        );
-    if plan.clicked() {
-        app.plan_recovery();
+    ui.horizontal(|ui| {
+        let plan = ui
+            .add_enabled(
+                has_agent && (has_spl || has_uboot) && has_port && idle,
+                egui::Button::new("Plan recovery..."),
+            )
+            .explain(
+                "Writes the SPL at 0x0 and U-Boot at 0x100000 of the board's QSPI NOR flash, \
+                 through the recovery agent's menu. An SPL needs the U-Boot payload beside it.",
+            )
+            .explain_disabled(
+                "Name the port, choose the recovery agent, and choose at least one of an SPL or a \
+                 U-Boot payload to write.",
+            );
+        if plan.clicked() {
+            app.plan_recovery();
+        }
+
+        let boot = ui
+            .add_enabled(
+                has_spl && has_uboot && has_port && idle,
+                egui::Button::new("Boot U-Boot in RAM"),
+            )
+            .explain(
+                "Sends the SPL to the BootROM and U-Boot to the SPL, without the agent, and stops \
+                 U-Boot at its prompt. Nothing is written. The serial console then starts its \
+                 mass-storage gadget, and the eMMC is written as a disk.",
+            )
+            .explain_disabled(
+                "Name the port, and choose an SPL and a U-Boot payload. The SPL must be a mainline \
+                 SPL built to load U-Boot from the UART.",
+            );
+        if boot.clicked() {
+            app.ram_boot();
+        }
+    });
+
+    // What the board said during the last job, kept once it has ended. The
+    // agent's own words are the best account of a write that failed.
+    if app.session.recovery.job.is_none() && !app.session.recovery.transcript.is_empty() {
+        ui.add_space(4.0);
+        ui.weak("What the board printed during the last job:");
+        let transcript = app.session.recovery.transcript.clone();
+        transcript_box(ui, &transcript);
     }
 }
 
 /// One of a recovery's three files: what it is, whether it is chosen, and the
 /// buttons to choose or forget it.
 ///
-/// The agent is required. The SPL and the U-Boot payload are each optional, but at
-/// least one of the two is needed. The plan button enforces that, not this row.
+/// Which files are needed depends on the job: a recovery needs the agent and at
+/// least one of the others, and a RAM boot the SPL and U-Boot. The buttons enforce
+/// that, not this row, and `note` says it beside an empty row.
 fn recovery_file_row(
     app: &mut App,
     ui: &mut egui::Ui,
     kind: RecoveryFileKind,
     label: &str,
-    required: bool,
+    note: &str,
 ) {
     // Read what is chosen out first, so the buttons below can take `app` mutably.
     let chosen: Option<(String, u64)> = {
@@ -3439,7 +3471,7 @@ fn recovery_file_row(
         label,
         chosen,
         app.is_picking_recovery_file(),
-        if required { "required" } else { "optional" },
+        note,
     );
     if pressed.choose {
         app.pick_recovery_file(kind);
@@ -3520,24 +3552,45 @@ struct FileRowPressed {
     forget: bool,
 }
 
-/// A recovery running: the same shape as [`bootstrap_panel`], for the serial job.
+/// A StarFive job running: the same shape as [`bootstrap_panel`], for the serial
+/// job, with what the board prints below it.
 ///
-/// It carries the same reminder the plan does. A progress bar filling up reads as
-/// a write being verified, and this write is not verified.
+/// A recovery carries the same reminder the plan does. A progress bar filling up
+/// reads as a write being verified, and this write is not verified. The transcript
+/// is drawn as the console's is, rendered only when it changes, because the agent
+/// prints its writes as they happen and a long flash write that showed nothing
+/// would look hung.
 fn recovery_job_panel(app: &App, job: &crate::state::RecoveryJob, ui: &mut egui::Ui) {
+    let footer = if job.writes {
+        "Each block is acknowledged as it is received, and the agent reports each write. The \
+         write is not read back."
+    } else {
+        "Nothing is written. U-Boot is stopped at its prompt once it comes up."
+    };
     progress_panel(
         ui,
         app.now(),
         job,
         &Panel {
-            title: "Recovering over serial",
+            title: job.label,
             boundary: "block",
             notes: &[],
-            footer: Some(
-                "Each block is acknowledged as it is received. The write is not read back.",
-            ),
+            footer: Some(footer),
         },
     );
+
+    let id = ui.id().with("recovery_transcript");
+    let seen = job.bytes_seen();
+    let cached: Option<(u64, String)> = ui.memory(|memory| memory.data.get_temp(id));
+    let text = match cached {
+        Some((at, text)) if at == seen => text,
+        _ => {
+            let text = job.transcript();
+            ui.memory_mut(|memory| memory.data.insert_temp(id, (seen, text.clone())));
+            text
+        }
+    };
+    transcript_box(ui, &text);
 }
 
 /// The serial console entry.
@@ -4094,8 +4147,16 @@ fn success(report: &Report, ui: &mut egui::Ui) {
         Report::Recovered => {
             ui.strong("Recovery complete.");
             ui.weak(
-                "The transfer was acknowledged, but this board's write cannot be read back. \
-                 Power off, return the boot strap to normal, and power on.",
+                "The agent reported every write as done, but this board's write cannot be read \
+                 back. Power off, return the boot strap to normal, and power on.",
+            );
+        }
+        Report::UartBooted => {
+            ui.strong("U-Boot is running in RAM, stopped at its prompt.");
+            ui.weak(
+                "Nothing was written. Open the serial console below on the same port and start the \
+                 mass-storage gadget. The board's eMMC then appears under Disks, where a write \
+                 reads back every window.",
             );
         }
         Report::TableWritten { format, authored } => {
@@ -5073,11 +5134,11 @@ fn disabled_confirm_reason(app: &App, what: &str) -> String {
     )
 }
 
-/// The medium a recovery writes to, named for a person.
-fn medium_name(target: RecoveryTarget) -> &'static str {
-    match target {
-        RecoveryTarget::NorFlash => "QSPI NOR flash",
-        RecoveryTarget::Emmc => "eMMC",
+/// How an SPL's header came to be, in the words a plan uses.
+fn origin_words(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Headered => "its header checked",
+        Origin::HeaderedHere => "headered here",
     }
 }
 
@@ -5118,28 +5179,37 @@ fn recovery_plan_screen(app: &mut App, ui: &mut egui::Ui) {
                 ui.monospace(&port);
                 ui.end_row();
 
-                ui.label("target");
-                ui.monospace(medium_name(plan.target));
+                ui.label("writes");
+                ui.monospace("QSPI NOR flash");
                 ui.end_row();
 
                 ui.label("agent");
                 ui.monospace(format!(
-                    "{} (uploaded into SRAM first)",
+                    "{}, sent to the BootROM first",
                     human_bytes(plan.agent_bytes)
                 ));
                 ui.end_row();
 
                 for stage in &plan.stages {
+                    let origin = match stage.origin {
+                        Some(origin) => format!(", {}", origin_words(origin)),
+                        None => String::new(),
+                    };
                     ui.label(stage.kind.name());
                     ui.monospace(format!(
-                        "{} (agent menu option {}, to {})",
+                        "{} at {:#x}, agent menu entry {}{origin}",
                         human_bytes(stage.image_bytes),
+                        stage.offset,
                         stage.menu_option,
-                        medium_name(plan.target),
                     ));
                     ui.end_row();
                 }
             });
+
+        if let Some(backup) = plan.describe_backup() {
+            ui.add_space(8.0);
+            prose(ui, &backup);
+        }
 
         // The one fact a StarFive recovery is owed that no other write is. It is on
         // this screen, and prominent, because a person deciding whether to say yes
@@ -5152,9 +5222,10 @@ fn recovery_plan_screen(app: &mut App, ui: &mut egui::Ui) {
             );
             prose(
                 ui,
-                "The recovery protocol cannot read flash. Each transfer is confirmed only by the \
-                 receiver's per-block acknowledgment. That proves the bytes were received, not \
-                 that the flash holds them. A Rockchip write is verified, and this one cannot be.",
+                "The recovery protocol cannot read flash. Each block is acknowledged as it is \
+                 received, and the agent reports whether each write finished. That proves the \
+                 bytes were received and written, not that the flash holds them. A Rockchip write \
+                 is verified, and this one cannot be.",
             );
         }
 
@@ -5404,7 +5475,6 @@ mod tests {
     use pyrographer_core::agent::ReadBack;
     use pyrographer_core::agent::{DfuAgent, FlashAgent};
     use pyrographer_core::partition::{Overlap, TableFormat};
-    use pyrographer_core::recovery::RecoveryTarget;
     use pyrographer_core::soc::Soc;
     use pyrographer_core::transport::testing::ScriptedTransport;
     use pyrographer_core::verbs::{ClonePlan, Segment, SegmentedPlan, TableAction, WritePlan};
@@ -6299,12 +6369,12 @@ mod tests {
         use pyrographer_core::transport::testing::ScriptedSerial;
 
         let mut app = an_app();
-        app.session
-            .set_recovery_agent(Some(a_recovery_blob("agent.bin", 4096)));
+        app.session.set_recovery_agent(Some(an_agent_blob()));
         app.session
             .set_recovery_spl(Some(a_recovery_blob("spl.bin", 2048)));
+        app.session.set_recovery_uboot(Some(a_fit_blob()));
         app.session
-            .plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash)
+            .plan_recovery("/dev/ttyUSB0".to_string())
             .expect("a plan");
 
         // Say yes to it and start it, so a real job is in flight. The scripted
@@ -6327,8 +6397,7 @@ mod tests {
             .session
             .start_recovery(
                 ScriptedSerial::new(Vec::new()),
-                request,
-                confirmed,
+                crate::state::StarfiveTask::Recover { request, confirmed },
                 0.0,
                 Box::new(|| {}),
             )
@@ -6337,7 +6406,7 @@ mod tests {
 
         // A second recovery plan behind it, and a write plan over the top.
         app.session
-            .plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash)
+            .plan_recovery("/dev/ttyUSB0".to_string())
             .expect("a plan");
         app.session.devices_seen(vec![a_device(12)], 0.0);
         app.session.select_target(a_device(12), a_device(12));
@@ -6603,6 +6672,26 @@ mod tests {
         }
     }
 
+    /// A recovery agent, as the plan checks one: headered, carrying its menu.
+    fn an_agent_blob() -> PickedBlob {
+        let mut body = b"agent select the function to test: ".to_vec();
+        body.resize(4096, 0x13);
+        PickedBlob {
+            name: "agent.bin".to_string(),
+            bytes: pyrographer_core::codec::splhdr::build(&body),
+        }
+    }
+
+    /// A U-Boot payload, as the plan checks one: a FIT.
+    fn a_fit_blob() -> PickedBlob {
+        let mut bytes = vec![0xd0, 0x0d, 0xfe, 0xed];
+        bytes.resize(8192, 0x31);
+        PickedBlob {
+            name: "u-boot.itb".to_string(),
+            bytes,
+        }
+    }
+
     /// The recovery section names the serial flow and states its one limit up
     /// front.
     ///
@@ -6623,6 +6712,31 @@ mod tests {
             words.contains("board's write is not read back"),
             "and its one limit is stated up front: {words}"
         );
+    }
+
+    /// The revealed section offers both of its jobs: writing the boot flash through
+    /// the agent, and booting U-Boot in RAM, which writes nothing.
+    #[test]
+    fn the_revealed_recovery_section_offers_a_ram_boot_beside_the_recovery() {
+        let mut app = an_app();
+        app.show_recovery = true;
+        let words = words_on(&mut app, Tab::Serial);
+        assert!(words.contains("Plan recovery"), "{words}");
+        assert!(words.contains("Boot U-Boot in RAM"), "{words}");
+        assert!(
+            words.contains("write nothing"),
+            "and says it writes nothing: {words}"
+        );
+    }
+
+    /// A RAM boot's report says where the board went, and what to do there: the
+    /// serial console's mass-storage gadget, and the disk it produces.
+    #[test]
+    fn the_ram_boot_report_points_at_the_console_and_the_disk() {
+        let words = drawn_report(&Report::UartBooted);
+        assert!(words.contains("stopped at its prompt"), "{words}");
+        assert!(words.contains("Nothing was written"), "{words}");
+        assert!(words.contains("mass-storage gadget"), "{words}");
     }
 
     /// The console section is inside the serial flow, and declared the same way the
@@ -6765,12 +6879,12 @@ mod tests {
     #[test]
     fn the_recovery_plan_screen_shows_what_it_writes_and_that_it_is_not_read_back() {
         let mut app = an_app();
-        app.session
-            .set_recovery_agent(Some(a_recovery_blob("agent.bin", 4096)));
+        app.session.set_recovery_agent(Some(an_agent_blob()));
         app.session
             .set_recovery_spl(Some(a_recovery_blob("spl.bin", 2048)));
+        app.session.set_recovery_uboot(Some(a_fit_blob()));
         app.session
-            .plan_recovery("/dev/ttyUSB0".to_string(), RecoveryTarget::NorFlash)
+            .plan_recovery("/dev/ttyUSB0".to_string())
             .expect("a plan");
 
         let words = words(&mut app);
@@ -6779,8 +6893,12 @@ mod tests {
         assert!(words.contains("QSPI NOR flash"), "the medium: {words}");
         assert!(words.contains("SPL"), "the stage: {words}");
         assert!(
-            words.contains("agent menu option 0"),
-            "and how it is written: {words}"
+            words.contains("at 0x0, agent menu entry 0, headered here"),
+            "and where and how it is written: {words}"
+        );
+        assert!(
+            words.contains("backup copy of the SPL at 0x200000"),
+            "and where its backup copy lands: {words}"
         );
         assert!(
             words.contains("This board's write is not read back"),
@@ -6855,10 +6973,10 @@ mod tests {
     fn a_recovery_over_a_port_that_will_not_open_spends_its_plan_and_reports() {
         let mut app = an_app();
         app.recover.port = "/dev/pyrographer-no-such-port".to_string();
-        app.session
-            .set_recovery_agent(Some(a_recovery_blob("agent.bin", 4096)));
+        app.session.set_recovery_agent(Some(an_agent_blob()));
         app.session
             .set_recovery_spl(Some(a_recovery_blob("spl.bin", 2048)));
+        app.session.set_recovery_uboot(Some(a_fit_blob()));
         app.plan_recovery();
 
         // Type the port back, which is what this build's gate asks for.
@@ -6903,10 +7021,10 @@ mod tests {
     fn a_recovery_opens_the_port_it_was_confirmed_for_not_the_form() {
         let mut app = an_app();
         app.recover.port = "/dev/pyrographer-agreed".to_string();
-        app.session
-            .set_recovery_agent(Some(a_recovery_blob("agent.bin", 4096)));
+        app.session.set_recovery_agent(Some(an_agent_blob()));
         app.session
             .set_recovery_spl(Some(a_recovery_blob("spl.bin", 2048)));
+        app.session.set_recovery_uboot(Some(a_fit_blob()));
         app.plan_recovery();
 
         if let Some(pending) = app.session.recovery.pending.as_mut()
@@ -6944,10 +7062,10 @@ mod tests {
     #[test]
     fn planning_a_recovery_with_no_port_refuses_and_shows_no_plan() {
         let mut app = an_app();
-        app.session
-            .set_recovery_agent(Some(a_recovery_blob("agent.bin", 4096)));
+        app.session.set_recovery_agent(Some(an_agent_blob()));
         app.session
             .set_recovery_spl(Some(a_recovery_blob("spl.bin", 2048)));
+        app.session.set_recovery_uboot(Some(a_fit_blob()));
 
         app.plan_recovery();
 

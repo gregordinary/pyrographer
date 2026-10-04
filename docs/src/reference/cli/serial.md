@@ -1,68 +1,135 @@
 # Serial lines
 
-Three commands work over a serial line rather than over USB. `recover` writes a bootloader to a
-StarFive board. `console` watches what a board prints on its serial console, and `uboot` drives a
+Four commands work over a serial line rather than over USB. `recover` writes a bootloader to a
+StarFive board's flash, and `uartboot` boots a StarFive board into U-Boot without writing
+anything. `console` watches what a board prints on its serial console, and `uboot` drives a
 bootloader prompt.
 
 ## Recovering a StarFive board
 
 StarFive's JH7110 boards, such as the VisionFive 2 and the Milk-V Mars CM, recover over a serial
 line. Their BootROM has no USB, and acts as an XMODEM receiver. The board therefore does not
-appear in `list`, and takes no `--device`. Strap the board into UART recovery, power it on, and
-name the serial port with `--port`.
+appear in `list`, and takes no `--device`. Strap the board into UART recovery, and name the
+serial port with `--port`. `recover` then waits for you to power the board on.
 
-`recover` uploads StarFive's recovery agent into SRAM. It then writes the bootloader through the
-agent's menu, to QSPI NOR flash or to eMMC:
+`recover` sends StarFive's recovery agent to the BootROM. It then writes the board's QSPI NOR
+flash through the agent's menu:
 
 ```sh
-pyrographer recover --port /dev/ttyUSB0 --target flash \
-    --agent jh7110-recovery-20230322.bin --spl u-boot-spl.bin
+pyrographer recover --port /dev/ttyUSB0 --agent jh7110-recovery-20230322.bin \
+    --spl u-boot-spl.bin.normal.out --uboot u-boot.itb
 ```
 
 ```text
 
-This will recover a StarFive JH7110 board over /dev/ttyUSB0, writing to QSPI NOR flash.
+This will write the boot flash of a StarFive JH7110 board over /dev/ttyUSB0.
 
-  agent        174.50 KiB (uploaded into SRAM first)
-  SPL          145.00 KiB (agent menu option 0, to QSPI NOR flash)
+  agent        161.41 KiB, sent to the BootROM first
+  SPL          137.72 KiB at 0x0, agent menu entry 0, its header checked
+  U-Boot       1.24 MiB at 0x100000, agent menu entry 2
+
+The agent writes a backup copy of the SPL at 0x200000, inside the U-Boot region. U-Boot is written after it and overwrites that copy, as StarFive's own procedure does.
 
 Warning: this write is not read back. The recovery protocol cannot read
 flash. Each block's acknowledgment confirms that the board received it,
-not that the flash holds it.
+and the agent's verdict that its write finished, not that the flash
+holds it.
 Nothing here can be undone.
 Proceed? [y/N]
 ```
 
 The whole recovery is `[UNVERIFIED]` against hardware.
 
-At least one of `--spl` and `--uboot` is required:
+`recover` takes three files:
 
-- `--spl` takes a raw `u-boot-spl.bin`, and `recover` wraps it in the 1024-byte StarFive header.
-- `--uboot` takes a U-Boot FIT payload and sends it unchanged.
+- `--agent` takes the recovery agent, a `jh7110-recovery-*.bin` from StarFive's Tools
+  repository. `recover` checks its header, and that it carries the agent's menu.
+- `--spl` takes the SPL, as a raw `u-boot-spl.bin` or as a `u-boot-spl.bin.normal.out`.
+  `recover` adds the 1024-byte StarFive header to a raw file, and checks the header a
+  `.normal.out` already carries.
+- `--uboot` takes the U-Boot payload, a FIT image such as `u-boot.itb`, and sends it unchanged.
 
-Give both to write the whole boot chain, SPL first. `--dry-run` prints the plan and stops
-without opening the port, and `--yes` skips the confirmation, as they do for `flash`.
+At least one of `--spl` and `--uboot` is required, and `--spl` requires `--uboot` as well. The
+agent writes a second copy of the SPL at 2 MiB, inside the U-Boot region. An SPL written alone
+therefore breaks the U-Boot already on the board. With both files, the SPL is written first and
+U-Boot second, as StarFive's own procedure does.
 
-**`--target` must name the medium the board boots from.** An SPL for NOR flash and one for eMMC
-differ in their header. Sending one to the other's slot leaves the board unable to boot.
-`recover` builds the header for the medium you name.
+`recover` refuses a file larger than the agent writes: 1 MiB for the SPL with its header, and
+15 MiB for U-Boot. `--dry-run` prints the plan and stops without opening the port. `--yes` skips
+the confirmation, as it does for `flash`.
 
-**The write is not read back.** The recovery protocol cannot read flash. The receiver
-acknowledges only that it received the bytes, which does not prove the flash holds them. Every
-other write in pyrographer reads each window back. The plan states this before you confirm, and
-`recover` repeats it at the end:
+**`recover` types at the agent only when the agent asks.** Whenever the agent is not receiving a
+file, it reads a line of input, and it reads stray bytes as typing. `recover` waits for the
+agent's prompt before it types a menu choice, and for the agent to ask for a file before it sends
+one. If the agent answers a block with text, `recover` stops at once.
+
+**OTP fuses are never touched.** The agent's menu also offers to burn the SoC's OTP fuses, which
+cannot be undone. `recover` never chooses that entry. If the fuse menu ever appears, `recover`
+stops, sends nothing more, and tells you to power the board off.
+
+**The write is not read back.** The recovery protocol cannot read flash. After each file the agent
+reports `updata success` or `updata fail`, and `recover` reports a failure as an error. Neither
+verdict proves that the flash holds the file. Every other write in pyrographer reads each window
+back. The plan states this before you confirm, and `recover` repeats it at the end:
 
 ```text
-Recovery complete. The transfer was acknowledged, but this board's write cannot be read back.
+Recovery complete. The agent reported every write as done. This board's write cannot be read back.
 Power off, return the boot strap to normal, and power on.
 ```
 
-The recovery agent's menu also offers to burn OTP fuses. No option of `recover` reaches that
-entry, because burning a fuse is permanent.
+`recover` writes the QSPI NOR flash and not the eMMC. The agent's eMMC entries write the SPL over
+the start of the disk, where its partition table is. To write a board's eMMC, boot U-Boot in RAM
+and write the eMMC as a disk, as the next section describes.
 
 On Linux, opening a serial port requires your user to be in the `dialout` group, or in `uucp` on
 some distributions. If the open is refused, pyrographer says so. The window has the same recovery
 flow, as [Recovering a StarFive board](../gui.md#recovering-a-starfive-board) describes.
+
+## Booting a StarFive board into U-Boot
+
+`uartboot` brings a StarFive board up into U-Boot in RAM, and writes nothing. It sends an SPL to
+the BootROM, and the SPL loads U-Boot over the same serial line by YMODEM. `uartboot` then stops
+U-Boot at its prompt. It is the serial counterpart of `db`, which loads U-Boot into a Rockchip
+board over USB.
+
+```sh
+pyrographer uartboot --port /dev/ttyUSB0 \
+    --spl u-boot-spl.bin.normal.out --uboot u-boot.itb
+```
+
+```text
+
+Booting U-Boot in RAM on a StarFive JH7110 board over /dev/ttyUSB0. Nothing is written to the board.
+
+  SPL          137.72 KiB, sent to the BootROM, its header checked
+  U-Boot       1.24 MiB, sent to the SPL by YMODEM
+
+U-Boot is running in RAM, stopped at its prompt. Nothing was written to the board.
+Run `pyrographer uboot --port /dev/ttyUSB0 --gadget ums` to hand its eMMC to this machine as a disk.
+```
+
+The SPL must be a mainline U-Boot SPL built with `CONFIG_SPL_YMODEM_SUPPORT`, which mainline's
+VisionFive 2 configuration sets. With the board still strapped for UART recovery, that SPL loads
+U-Boot from the serial line. StarFive's own SPL loads U-Boot from SPI flash instead, and
+`uartboot` reports the device the SPL names. `--prompt` names a U-Boot prompt other than `=> `.
+
+`uartboot` is `[UNVERIFIED]` against hardware.
+
+### Writing a StarFive eMMC as a disk
+
+A RAM-booted U-Boot built with `CONFIG_CMD_USB_MASS_STORAGE` hands the board's eMMC to this
+machine as a disk. Mainline's VisionFive 2 configuration does not enable it, so U-Boot has to be
+built with it. The [block-device commands](block-devices.md) then write the disk, and read back
+every window they write:
+
+1. Strap the board into UART recovery. Connect the serial adapter, and a USB cable from this
+   machine to the board's USB device port.
+2. Run `uartboot`, and power the board on.
+3. Run `uboot --gadget ums` on the same port. If the eMMC is not `mmc:0`, name it with
+   `--gadget-dev`. `uboot --cmd 'mmc list'` lists the board's MMC devices.
+4. Run `list --blocks` to find the disk, and write it with `flash --device`.
+
+The route is `[UNVERIFIED]` against hardware.
 
 ## Watching a serial console
 
