@@ -38,8 +38,8 @@ use pyrographer_core::soc::Soc;
 use pyrographer_core::transport::{Serial, Transport};
 use pyrographer_core::uboot::{BootPlan, ConfirmedBoot};
 use pyrographer_core::verbs::{
-    self, ClonePlan, ConfirmedClone, ConfirmedSegmentedWrite, ConfirmedWrite, SegmentedPlan,
-    WritePlan,
+    self, ClonePlan, ConfirmedClone, ConfirmedFirmwareWrite, ConfirmedSegmentedWrite,
+    ConfirmedWrite, FirmwarePlan, SegmentedPlan, WritePlan,
 };
 
 use crate::platform::{self, Handle, PickedBlob, PickedImage, Wake};
@@ -521,8 +521,8 @@ pub struct Pending {
     pub refused: Option<String>,
 }
 
-/// A write, a clone, or a table repair that a board has described and nobody has
-/// agreed to yet.
+/// A write, a clone, a table repair, or a firmware write that a board has
+/// described and nobody has agreed to yet.
 #[derive(Clone)]
 pub enum Plan {
     /// An image onto this board.
@@ -532,6 +532,8 @@ pub enum Plan {
     /// A table repair or authoring: a damaged GPT or parameter copy rewritten from
     /// an intact one, or a fresh table written from a layout.
     Table(SegmentedPlan),
+    /// A firmware package, or a loader's ID block alone.
+    Firmware(FirmwarePlan),
 }
 
 impl Plan {
@@ -546,6 +548,7 @@ impl Plan {
             Plan::Write(plan) => verbs::plan_refusal(agent, plan),
             Plan::Clone(plan) => verbs::plan_refusal(agent, &plan.destination),
             Plan::Table(plan) => verbs::segmented_refusal(agent, plan),
+            Plan::Firmware(plan) => verbs::firmware_refusal(agent, plan),
         }
     }
 }
@@ -558,6 +561,8 @@ pub enum Confirmed {
     Clone(ConfirmedClone),
     /// A table repair or authoring.
     Table(ConfirmedSegmentedWrite),
+    /// A firmware package, or an ID block alone.
+    Firmware(ConfirmedFirmwareWrite),
 }
 
 impl Pending {
@@ -576,6 +581,7 @@ impl Pending {
             Plan::Write(plan) => Confirmed::Write(plan.confirm()),
             Plan::Clone(plan) => Confirmed::Clone(plan.confirm()),
             Plan::Table(plan) => Confirmed::Table(plan.confirm()),
+            Plan::Firmware(plan) => Confirmed::Firmware(plan.confirm()),
         }
     }
 }
@@ -1571,6 +1577,11 @@ impl<T: Transport> Session<T> {
                 self.pending = self.awaiting(Plan::Table(plan.clone()));
             }
 
+            Report::PlannedFirmware(plan) => {
+                self.target.chip_version = Some(plan.chip_version.clone());
+                self.pending = self.awaiting(Plan::Firmware(plan.clone()));
+            }
+
             // A board that has taken a reset has left, under every mode -- and the
             // three that are not a plain reboot leave it somewhere no verb here
             // can reach. Everything it told us was about a board no longer there.
@@ -1590,7 +1601,8 @@ impl<T: Transport> Session<T> {
             | Report::Bootstrapped { .. }
             | Report::IngenicBootstrapped(_)
             | Report::Recovered
-            | Report::TableWritten { .. } => {}
+            | Report::TableWritten { .. }
+            | Report::FirmwareWritten { .. } => {}
         }
     }
 

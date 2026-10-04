@@ -3,8 +3,8 @@
 //!
 //! A Rockchip loader (`_loader.bin`, the file `db` takes) is a small container. It
 //! lists the code sections and says where each goes. This module parses that
-//! container into the two sections a bootstrap needs: the 471 DRAM-init blobs and
-//! the 472 loader.
+//! container into its three tables. A bootstrap uploads the 471 DRAM-init blobs and
+//! the 472 loader, and an ID block is built from the flash stages.
 //!
 //! It then prepares each section for the wire: the section's bytes exactly as the
 //! container stores them, plus a trailing CRC-16. One zero byte of padding goes
@@ -57,6 +57,9 @@ const OFF_471_ENTRY_SIZE: usize = 30;
 const OFF_472_COUNT: usize = 31;
 const OFF_472_OFFSET: usize = 32;
 const OFF_472_ENTRY_SIZE: usize = 36;
+const OFF_STAGE_COUNT: usize = 37;
+const OFF_STAGE_OFFSET: usize = 38;
+const OFF_STAGE_ENTRY_SIZE: usize = 42;
 const OFF_RC4_FLAG: usize = 44;
 /// The smallest header that carries every descriptor field above.
 const HEADER_MIN: usize = OFF_RC4_FLAG + 1;
@@ -86,18 +89,25 @@ pub struct CodeBlob {
     pub delay_ms: u32,
 }
 
-/// A parsed loader, reduced to what a bootstrap needs.
+/// A parsed loader: its three tables, its chip field, and its RC4 flag.
 ///
-/// The container also holds a third table, the flash-stage `loader` blobs. A
-/// flash write lays those down, and they play no part in bringing a maskrom board
-/// to loader mode, so this parser skips them. The image holds the 471 and 472
-/// sections in upload order, the container's chip field, and its RC4 flag.
+/// The 471 and 472 sections bring a maskrom board to loader mode, and are held in
+/// upload order. The flash stages are what an ID block is built from, and play no
+/// part in the bootstrap. [`idb`](super::idb) lays them out.
 #[derive(Debug, Clone)]
 pub struct LoaderImage {
     /// The DRAM-init sections, uploaded first with `wIndex = 0x0471`.
     pub code_471: Vec<CodeBlob>,
     /// The loader sections, uploaded after with `wIndex = 0x0472`.
     pub code_472: Vec<CodeBlob>,
+    /// The flash stages, from the container's third table, in table order.
+    ///
+    /// On an RK3576 container they are `FlashHead`, `FlashBoost`, `FlashData` and
+    /// `FlashBoot`. Each is stored scrambled per 512-byte block, whatever the
+    /// [`rc4_disabled`](Self::rc4_disabled) flag says, and is held here as stored.
+    /// [`idb`](super::idb) decides what the flash holds. A loader built from bare
+    /// stage files has none.
+    pub flash_stages: Vec<CodeBlob>,
     /// The chip the container says it is for, as four raw bytes. It is `None` for a
     /// loader assembled from bare stage files, which carry no container and so make
     /// no claim.
@@ -124,10 +134,9 @@ pub struct LoaderImage {
     /// plain data where older BootROMs took RC4-scrambled data.
     ///
     /// It does not change what goes on the wire, because the download-boot sends
-    /// each section's stored bytes verbatim on every chip. The flag governs whether
-    /// the on-flash ID-block build re-scrambles, and pyrographer has no ID-block
-    /// build. It is parsed as a fact about the file, and reported but not
-    /// consulted.
+    /// each section's stored bytes verbatim on every chip. It governs the ID block:
+    /// with the flag set, the flash stages are unscrambled before they are laid
+    /// out, as [`idb`](super::idb) describes.
     pub rc4_disabled: bool,
 }
 
@@ -173,6 +182,7 @@ impl LoaderImage {
             code_472: code_472
                 .map(|section| vec![blob(section, RAW_DELAY_472_MS)])
                 .unwrap_or_default(),
+            flash_stages: Vec::new(),
             chip: None,
             rc4_disabled: true,
         }
@@ -218,6 +228,13 @@ pub fn parse(bytes: &[u8]) -> Result<LoaderImage> {
         OFF_472_ENTRY_SIZE,
         "472",
     )?;
+    let flash_stages = parse_table(
+        bytes,
+        OFF_STAGE_COUNT,
+        OFF_STAGE_OFFSET,
+        OFF_STAGE_ENTRY_SIZE,
+        "flash-stage",
+    )?;
     let rc4_disabled = bytes[OFF_RC4_FLAG] != 0;
     // Infallible: `HEADER_MIN` is past the end of this field, and the length
     // check above has already run.
@@ -228,12 +245,16 @@ pub fn parse(bytes: &[u8]) -> Result<LoaderImage> {
     Ok(LoaderImage {
         code_471,
         code_472,
+        flash_stages,
         chip,
         rc4_disabled,
     })
 }
 
-/// Parse one entry table (471 or 472) into its blobs.
+/// Parse one entry table (471, 472, or the flash stages) into its blobs.
+///
+/// An empty table is empty whatever its offset and stride say, because there is no
+/// entry for either to misplace.
 fn parse_table(
     bytes: &[u8],
     count_off: usize,
@@ -242,6 +263,9 @@ fn parse_table(
     which: &'static str,
 ) -> Result<Vec<CodeBlob>> {
     let count = usize::from(byte(bytes, count_off)?);
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let table = le_u32(bytes, offset_off)? as usize;
     let stride = usize::from(byte(bytes, entry_size_off)?);
     if stride < ENTRY_SIZE {
@@ -387,21 +411,34 @@ mod tests {
 
     /// Build a minimal but valid RKBOOT container: `code_471` and `code_472` each a
     /// list of `(name, data, delay_ms)`, and the rc4 flag. The layout matches what
-    /// `parse` reads: a `HEADER_MIN`-byte header, then the two entry tables, then
-    /// the section data each entry points at.
+    /// `parse` reads: a `HEADER_MIN`-byte header, then the entry tables, then the
+    /// section data each entry points at.
     fn build(
         tag: u32,
         code_471: &[(&str, &[u8], u32)],
         code_472: &[(&str, &[u8], u32)],
         rc4_flag: u8,
     ) -> Vec<u8> {
-        let entries: Vec<&(&str, &[u8], u32)> = code_471.iter().chain(code_472).collect();
+        build_with_stages(tag, code_471, code_472, &[], rc4_flag)
+    }
+
+    /// [`build`], with a flash-stage table as well.
+    fn build_with_stages(
+        tag: u32,
+        code_471: &[(&str, &[u8], u32)],
+        code_472: &[(&str, &[u8], u32)],
+        stages: &[(&str, &[u8], u32)],
+        rc4_flag: u8,
+    ) -> Vec<u8> {
+        let entries: Vec<&(&str, &[u8], u32)> =
+            code_471.iter().chain(code_472).chain(stages).collect();
         let header_size = HEADER_MIN;
         let table_471 = header_size;
         let table_472 = table_471 + code_471.len() * ENTRY_SIZE;
-        let data_start = table_472 + code_472.len() * ENTRY_SIZE;
+        let table_stages = table_472 + code_472.len() * ENTRY_SIZE;
+        let data_start = table_stages + stages.len() * ENTRY_SIZE;
 
-        // Lay out the section data after both tables, recording each blob's offset.
+        // Lay out the section data after the tables, recording each blob's offset.
         let mut blob_at = Vec::new();
         let mut cursor = data_start;
         for (_, data, _) in &entries {
@@ -412,21 +449,40 @@ mod tests {
 
         let mut buf = vec![0u8; total];
         buf[OFF_TAG..OFF_TAG + 4].copy_from_slice(&tag.to_le_bytes());
-        buf[OFF_471_COUNT] = code_471.len() as u8;
-        buf[OFF_471_OFFSET..OFF_471_OFFSET + 4].copy_from_slice(&(table_471 as u32).to_le_bytes());
-        buf[OFF_471_ENTRY_SIZE] = ENTRY_SIZE as u8;
-        buf[OFF_472_COUNT] = code_472.len() as u8;
-        buf[OFF_472_OFFSET..OFF_472_OFFSET + 4].copy_from_slice(&(table_472 as u32).to_le_bytes());
-        buf[OFF_472_ENTRY_SIZE] = ENTRY_SIZE as u8;
+        for (count_off, offset_off, size_off, count, table) in [
+            (
+                OFF_471_COUNT,
+                OFF_471_OFFSET,
+                OFF_471_ENTRY_SIZE,
+                code_471.len(),
+                table_471,
+            ),
+            (
+                OFF_472_COUNT,
+                OFF_472_OFFSET,
+                OFF_472_ENTRY_SIZE,
+                code_472.len(),
+                table_472,
+            ),
+            (
+                OFF_STAGE_COUNT,
+                OFF_STAGE_OFFSET,
+                OFF_STAGE_ENTRY_SIZE,
+                stages.len(),
+                table_stages,
+            ),
+        ] {
+            buf[count_off] = count as u8;
+            buf[offset_off..offset_off + 4].copy_from_slice(&(table as u32).to_le_bytes());
+            buf[size_off] = ENTRY_SIZE as u8;
+        }
         buf[OFF_RC4_FLAG] = rc4_flag;
         buf[OFF_CHIP..OFF_CHIP + CHIP_LEN].copy_from_slice(b"6753");
 
         for (i, (name, data, delay)) in entries.iter().enumerate() {
-            let entry = if i < code_471.len() {
-                table_471 + i * ENTRY_SIZE
-            } else {
-                table_472 + (i - code_471.len()) * ENTRY_SIZE
-            };
+            // The tables sit back to back in entry order, so the i-th entry of the
+            // concatenated list is the i-th slot after the first table.
+            let entry = table_471 + i * ENTRY_SIZE;
             buf[entry] = ENTRY_SIZE as u8;
             for (u, unit) in name.encode_utf16().enumerate() {
                 let at = entry + E_NAME + u * 2;
@@ -441,6 +497,39 @@ mod tests {
             buf[blob_at[i]..blob_at[i] + data.len()].copy_from_slice(data);
         }
         buf
+    }
+
+    /// The third table comes back as the flash stages, in table order and as
+    /// stored, and leaves the two bootstrap tables as they were.
+    #[test]
+    fn parse_reads_the_flash_stages_as_well_as_the_bootstrap() {
+        let bytes = build_with_stages(
+            TAG_LDR,
+            &[("UsbHead", &[0x11], 1)],
+            &[("usbplug", &[0x22], 0)],
+            &[("FlashHead", &[0x33, 0x34], 0), ("FlashData", &[0x35], 0)],
+            1,
+        );
+        let loader = parse(&bytes).expect("a container with three tables parses");
+        assert_eq!(loader.code_471[0].data, [0x11]);
+        assert_eq!(loader.code_472[0].data, [0x22]);
+        let names: Vec<&str> = loader
+            .flash_stages
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["FlashHead", "FlashData"]);
+        assert_eq!(loader.flash_stages[0].data, [0x33, 0x34]);
+    }
+
+    /// A container with no flash stages has an empty table, whatever stride its
+    /// header gives an empty table. Bare stage files have none either.
+    #[test]
+    fn an_empty_stage_table_is_empty() {
+        let mut bytes = build(TAG_LDR, &[("UsbHead", &[1], 0)], &[], 0);
+        bytes[OFF_STAGE_ENTRY_SIZE] = 0;
+        assert!(parse(&bytes).expect("parses").flash_stages.is_empty());
+        assert!(LoaderImage::from_raw(None, None).flash_stages.is_empty());
     }
 
     #[test]
@@ -647,6 +736,21 @@ mod tests {
         assert!(
             !loader.code_471[0].data.is_empty() && !loader.code_472[0].data.is_empty(),
             "the sections carry data"
+        );
+        let stages: Vec<(&str, usize)> = loader
+            .flash_stages
+            .iter()
+            .map(|stage| (stage.name.as_str(), stage.data.len()))
+            .collect();
+        assert_eq!(
+            stages,
+            [
+                ("FlashHead", 4096),
+                ("FlashBoost", 4096),
+                ("FlashData", 81920),
+                ("FlashBoot", 270_336)
+            ],
+            "the flash stages the ID block is built from"
         );
     }
 }

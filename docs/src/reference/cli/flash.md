@@ -92,6 +92,10 @@ pyrographer builds the plan by querying the device, through the same code path a
 `--dry-run` prints the plan and stops there, and `--yes` skips the question. If no terminal is
 attached and `--yes` is absent, `flash` refuses.
 
+`flash` also refuses a Rockchip firmware package and a loader container, which do not boot when
+written raw. [Firmware files written raw](firmware.md#firmware-files-written-raw) shows the
+refusal and the commands that write each.
+
 ### The touches line
 
 Read the `touches` line before you confirm. It names the partitions the range lands in, which

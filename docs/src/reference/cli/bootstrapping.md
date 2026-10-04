@@ -37,7 +37,9 @@ that a loader answers.
 ```
 
 `db` parses the file before it opens any device, and refuses a file that is not an RKBOOT
-loader. It also refuses a board that is not in maskrom mode.
+loader. It also refuses a board that is not in maskrom mode. A Rockchip firmware package
+(`update.img`) carries a loader, and `--loader` takes the package itself, as
+[A board in maskrom](firmware.md#a-board-in-maskrom) shows.
 
 The container names the SoC it was built for, and `db` prints that claim first. With `--soc`,
 `db` checks the claim, and refuses a file built for another SoC before it uploads a byte.

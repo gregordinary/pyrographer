@@ -19,6 +19,7 @@ use pyrographer_core::Error;
 use pyrographer_core::agent::FlashInfo;
 use pyrographer_core::block::BlockDevice;
 use pyrographer_core::codec::console as console_codec;
+use pyrographer_core::codec::rkfw;
 use pyrographer_core::codec::rockusb::ResetMode;
 use pyrographer_core::discovery::{DeviceInfo, Mode};
 use pyrographer_core::fill::FillReport;
@@ -27,10 +28,11 @@ use pyrographer_core::progress::Progress;
 use pyrographer_core::soc::Soc;
 use pyrographer_core::uboot::Gadget;
 use pyrographer_core::verbs::{
-    ClonePlan, ParamMedium, SegmentedPlan, TableAction, Touches, WritePlan,
+    ClonePlan, FirmwarePlan, FirmwareWrite, LoaderCapability, ParamMedium, SegmentedPlan,
+    TableAction, Touches, WritePlan,
 };
 
-use crate::app::{App, AuthorSourceKind, Tab, Which};
+use crate::app::{App, AuthorSourceKind, FirmwareFileKind, Tab, Which};
 use crate::platform;
 use crate::state::{
     self, Aim, Chosen, Confirmation, Measured, Outcome, Plan, Report, Stoppable, Table, Task,
@@ -2043,6 +2045,7 @@ fn verbs_panel(app: &mut App, ui: &mut egui::Ui) {
 
         ui.add_space(6.0);
         table_tools(app, ui, idle, now);
+        firmware_tools(app, ui, idle, now);
     });
 }
 
@@ -2277,15 +2280,25 @@ fn actions(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
         if plan.clicked()
             && let (Some(aim), Some(image_bytes)) = (aimed.clone(), image_bytes)
         {
-            let soc = app.planned_soc();
-            app.run(
-                Task::PlanWrite {
-                    aim,
-                    image_bytes,
-                    soc,
-                },
-                now,
-            );
+            // The plan reads the image's first bytes, to refuse a container written
+            // raw before the board is asked anything. The write opens it again.
+            let reader = app.session.image.as_ref().map(|image| image.reader());
+            match reader {
+                Some(Ok(image)) => {
+                    let soc = app.planned_soc();
+                    app.run(
+                        Task::PlanWrite {
+                            aim,
+                            image_bytes,
+                            image,
+                            soc,
+                        },
+                        now,
+                    );
+                }
+                Some(Err(error)) => app.session.last = Some(Err(error)),
+                None => {}
+            }
         }
 
         // A clone names both boards and infers neither, because the difference
@@ -2448,6 +2461,171 @@ fn table_refusal(app: &App) -> Option<String> {
         format!(
             "Repair and authoring are refused: {why}. A partition table sits at fixed sectors \
              of a device-wide LBA space."
+        )
+    })
+}
+
+/// The firmware section: a whole Rockchip firmware package, or a loader's ID block
+/// alone.
+///
+/// Like the partition table tools, it is shut until asked for. Both writes are
+/// gated like any other, plan first and read-back after, and both reach the one
+/// firmware plan screen. A board with no device-wide LBA space is refused by core,
+/// and the section grays on the same answer, cached at open.
+fn firmware_tools(app: &mut App, ui: &mut egui::Ui, idle: bool, now: f64) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        let arrow = if app.show_firmware_tools { "v" } else { ">" };
+        if ui
+            .button(format!("{arrow}  Firmware"))
+            .explain(
+                "Write a Rockchip firmware package (update.img) whole, or a loader's ID block \
+                 alone. Both are gated writes that end at a plan screen. Nothing here writes \
+                 without your confirmation.",
+            )
+            .clicked()
+        {
+            app.show_firmware_tools = !app.show_firmware_tools;
+        }
+    });
+    if !app.show_firmware_tools {
+        return;
+    }
+    ui.add_space(4.0);
+
+    let refused = firmware_refusal_reason(app);
+    if let Some(why) = &refused {
+        guard(ui, why.clone());
+        ui.add_space(4.0);
+    }
+    let can_plan = idle && refused.is_none();
+    let busy_why = refused.unwrap_or_else(|| TABLE_TOOLS_BUSY.to_string());
+    let picking = app.is_picking();
+
+    prose(
+        ui,
+        "A firmware package carries a loader, a partition table and an image for each \
+         partition. Writing it lays down every image, a GPT from its parameter, and the ID \
+         block, as one plan. The whole package is read and checked first.",
+    );
+    let chosen = app
+        .firmware
+        .package
+        .as_ref()
+        .map(|file| (file.name.clone(), file.bytes));
+    let has_package = chosen.is_some();
+    let pressed = file_row(
+        ui,
+        "Package",
+        "a firmware package",
+        chosen,
+        picking,
+        "none chosen",
+    );
+    if pressed.choose {
+        app.pick_firmware_file(FirmwareFileKind::Package);
+    }
+    if pressed.forget {
+        app.forget_firmware_file(FirmwareFileKind::Package);
+    }
+    let plan = ui
+        .add_enabled(
+            can_plan && has_package && !picking,
+            egui::Button::new("Plan firmware write..."),
+        )
+        .explain_disabled(firmware_disabled_why(
+            can_plan,
+            has_package,
+            picking,
+            &busy_why,
+            "Choose a firmware package first.",
+        ))
+        .explain(
+            "Read and check the whole package, then show every run the write lays down. Nothing \
+             is written until you confirm the plan.",
+        );
+    if plan.clicked() {
+        app.plan_firmware(now);
+    }
+
+    ui.add_space(6.0);
+    prose(
+        ui,
+        "The ID block is the first stage the BootROM reads, at sector 64. A loader container \
+         carries its pieces, and they are laid out as the container's own header says. A \
+         firmware package works too, and its loader is used.",
+    );
+    let chosen = app
+        .firmware
+        .loader
+        .as_ref()
+        .map(|file| (file.name.clone(), file.bytes));
+    let has_loader = chosen.is_some();
+    let pressed = file_row(
+        ui,
+        "Loader",
+        "a loader for the ID block",
+        chosen,
+        picking,
+        "none chosen",
+    );
+    if pressed.choose {
+        app.pick_firmware_file(FirmwareFileKind::Loader);
+    }
+    if pressed.forget {
+        app.forget_firmware_file(FirmwareFileKind::Loader);
+    }
+    let id_block = ui
+        .add_enabled(
+            can_plan && has_loader && !picking,
+            egui::Button::new("Plan ID block write..."),
+        )
+        .explain_disabled(firmware_disabled_why(
+            can_plan,
+            has_loader,
+            picking,
+            &busy_why,
+            "Choose a loader first.",
+        ))
+        .explain(
+            "Build the ID block from the loader, check every hash its header records, and show \
+             where it lands. The partition table is left as it is.",
+        );
+    if id_block.clicked() {
+        app.plan_id_block(now);
+    }
+}
+
+/// Why a firmware button is grayed, in the order a person can fix it.
+fn firmware_disabled_why(
+    can_plan: bool,
+    has_file: bool,
+    picking: bool,
+    busy_why: &str,
+    choose_first: &str,
+) -> String {
+    if !can_plan {
+        busy_why.to_string()
+    } else if picking {
+        "Unavailable while a file dialog is open.".to_string()
+    } else if !has_file {
+        choose_first.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Why the board in the target slot cannot take firmware, as a sentence for the
+/// screen, or `None`.
+///
+/// It is core's [`raw_lba_refusal`](pyrographer_core::verbs::raw_lba_refusal),
+/// cached when the board was opened. Every firmware plan refuses on the same
+/// answer.
+fn firmware_refusal_reason(app: &App) -> Option<String> {
+    app.session.target.raw_lba_reason.map(|why| {
+        format!(
+            "Firmware writes are refused: {why}. A partition table and an ID block sit at fixed \
+             sectors of a device-wide LBA space."
         )
     })
 }
@@ -3941,9 +4119,34 @@ fn success(report: &Report, ui: &mut egui::Ui) {
                 );
             }
         }
+        Report::FirmwareWritten {
+            id_block_only,
+            runs,
+            bytes,
+        } => {
+            if *id_block_only {
+                ui.strong("Wrote the ID block at sector 64, and read every window of it back.");
+                ui.weak(
+                    "The partition table was left as it was. The BootROM reads the new ID block \
+                     the next time the board starts from this storage.",
+                );
+            } else {
+                ui.strong(format!(
+                    "Wrote the firmware package in {runs} runs, {}, and read every window back.",
+                    human_bytes(*bytes)
+                ));
+                ui.weak(
+                    "Read the partition table again to see the package's map. The BootROM reads \
+                     the new ID block the next time the board starts from this storage.",
+                );
+            }
+        }
         Report::Console(console) => console_report(console, ui),
         // The plan is a screen of its own, and it is showing.
-        Report::Planned(_) | Report::PlannedClone(_) | Report::PlannedTable(_) => {}
+        Report::Planned(_)
+        | Report::PlannedClone(_)
+        | Report::PlannedTable(_)
+        | Report::PlannedFirmware(_) => {}
     }
 }
 
@@ -4174,6 +4377,7 @@ fn plan_screen(app: &mut App, ui: &mut egui::Ui) {
             Plan::Write(plan) => write_plan(app, plan, ui),
             Plan::Clone(plan) => clone_plan(app, plan, ui),
             Plan::Table(plan) => table_plan(app, plan, ui),
+            Plan::Firmware(plan) => firmware_plan(app, plan, ui),
         }
 
         ui.add_space(8.0);
@@ -4362,6 +4566,157 @@ fn table_plan(app: &App, plan: &SegmentedPlan, ui: &mut egui::Ui) {
 
             // A table write is a write, so it says when it is checked in the
             // same words a write's plan does.
+            ui.label("checked");
+            ui.label(plan.read_back.describe());
+            ui.end_row();
+        });
+}
+
+/// What a firmware write would lay down: every run in the order it is written, the
+/// images the ID block holds, the table the board carries afterward, the entries
+/// left out, and both answers that gate an ID block.
+///
+/// Every run is colored for danger, because every one overwrites flash.
+fn firmware_plan(app: &App, plan: &FirmwarePlan, ui: &mut egui::Ui) {
+    let act = match &plan.what {
+        FirmwareWrite::Package {
+            model,
+            manufacturer,
+            version,
+        } => {
+            let name = app
+                .firmware
+                .package
+                .as_ref()
+                .map(|file| file.name.as_str())
+                .unwrap_or("the package");
+            format!(
+                "write the firmware package {name} ({model} by {manufacturer}, version {}). Its \
+                 partition table replaces the board's.",
+                rkfw::version_text(*version)
+            )
+        }
+        FirmwareWrite::IdBlock => {
+            "write an ID block at sector 64. The partition table is left as it is.".to_string()
+        }
+    };
+
+    egui::Grid::new("firmware-plan")
+        .num_columns(2)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            ui.label(match &app.session.target.device {
+                Some(Chosen::Block(_)) => "disk",
+                _ => "board",
+            });
+            if let Some(device) = &app.session.target.device {
+                ui.monospace(device_line(device));
+            }
+            ui.end_row();
+
+            ui.label("act");
+            measured(ui, |ui| {
+                ui.label(act);
+            });
+            ui.end_row();
+
+            for run in &plan.runs {
+                let last = (run.lba + run.sectors).saturating_sub(1);
+                ui.label("writing");
+                ui.vertical(|ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, &run.what);
+                    ui.monospace(format!(
+                        "LBA {} through {last}  ({} sectors, {})",
+                        run.lba,
+                        run.sectors,
+                        human_bytes(run.bytes)
+                    ));
+                });
+                ui.end_row();
+            }
+
+            ui.label("ID block");
+            ui.vertical(|ui| {
+                ui.label(format!(
+                    "laid out by the {} header, every hash checked",
+                    plan.id_block_header
+                ));
+                for image in &plan.id_block_images {
+                    let load = image
+                        .load_address
+                        .map(|address| format!(", loads at {address:#010x}"))
+                        .unwrap_or_default();
+                    ui.monospace(format!(
+                        "{} at sector {}, {} sectors{load}",
+                        image.stage, image.sector, image.sectors
+                    ));
+                }
+            });
+            ui.end_row();
+
+            ui.label("partitions");
+            partition_list(&plan.partitions, ui);
+            ui.end_row();
+
+            if !plan.skipped.is_empty() {
+                ui.label("not written");
+                ui.vertical(|ui| {
+                    for skipped in &plan.skipped {
+                        ui.label(format!("{}: {}", skipped.name, skipped.why));
+                    }
+                });
+                ui.end_row();
+            }
+
+            ui.label("loader file");
+            ui.monospace(match plan.loader_chip {
+                Some(chip) => {
+                    let claim = pyrographer_core::soc::by_container_chip(&chip)
+                        .map(|soc| soc.name())
+                        .unwrap_or("no pinned SoC");
+                    format!("{}  \"{}\"  ({claim})", hex(&chip), ascii(&chip))
+                }
+                None => "nothing: bare stage files carry no container".to_string(),
+            });
+            ui.end_row();
+
+            match &plan.capability {
+                LoaderCapability::NoLoader => {}
+                LoaderCapability::Answered(capability) if capability.new_idb() => {
+                    ui.label("capability");
+                    ui.label("NEW_IDB set: the loader writes an RKNS ID block");
+                    ui.end_row();
+                }
+                LoaderCapability::Answered(_) => {
+                    ui.label("capability");
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "NEW_IDB not set, and the write is refused",
+                    );
+                    ui.end_row();
+                }
+                LoaderCapability::NotAnswered(why) => {
+                    ui.label("capability");
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("no answer ({why}), and the write is refused"),
+                    );
+                    ui.end_row();
+                }
+            }
+
+            ui.label("flash");
+            ui.monospace(geometry(&plan.flash));
+            ui.end_row();
+
+            gate_rows(
+                app.session.target.device.as_ref(),
+                &plan.chip_version,
+                &plan.soc,
+                ui,
+            );
+            ui.end_row();
+
             ui.label("checked");
             ui.label(plan.read_back.describe());
             ui.end_row();
@@ -6813,6 +7168,196 @@ mod tests {
         );
     }
 
+    /// A firmware plan as a scripted RK3576 would carry one: a partition image,
+    /// both GPT copies and the ID block, with the loader claiming `NEW_IDB`.
+    fn a_firmware_plan() -> pyrographer_core::verbs::FirmwarePlan {
+        use pyrographer_core::codec::idb::IdbImage;
+        use pyrographer_core::verbs::{
+            FirmwarePlan, FirmwareWrite, LoaderCapability, Run, RunSource,
+        };
+
+        let run = |what: &str, lba: u64, sectors: u64, source: RunSource| Run {
+            what: what.to_string(),
+            lba,
+            bytes: sectors * 512,
+            sectors,
+            source,
+            touches: Touches::Partitions(Vec::new()),
+        };
+        FirmwarePlan {
+            what: FirmwareWrite::Package {
+                model: "RK3576".to_string(),
+                manufacturer: "rockchip".to_string(),
+                version: 0x0102_0003,
+            },
+            runs: vec![
+                run(
+                    "partition 'boot' from Image/boot.img",
+                    0xa000,
+                    2048,
+                    RunSource::Package { offset: 4096 },
+                ),
+                run(
+                    "the primary GPT (protective MBR, header, and entry array from sector 0)",
+                    0,
+                    34,
+                    RunSource::Held(vec![0; 34 * 512]),
+                ),
+                run(
+                    "the ID block, 3 images laid out by its RKNS header",
+                    64,
+                    704,
+                    RunSource::Held(vec![0; 704 * 512]),
+                ),
+            ],
+            partitions: vec![Partition {
+                name: "boot".to_string(),
+                first_lba: 0xa000,
+                sectors: 0x20000,
+            }],
+            skipped: vec![pyrographer_core::firmware::Skipped {
+                name: "package-file".to_string(),
+                path: "package-file".to_string(),
+                why: "the entry is the packing tool's own list of files",
+            }],
+            id_block_header: "FlashHead".to_string(),
+            id_block_images: vec![IdbImage {
+                stage: "FlashBoost".to_string(),
+                sector: 8,
+                sectors: 8,
+                load_address: Some(0x3ffc_0000),
+            }],
+            loader_chip: Some(*b"6753"),
+            capability: LoaderCapability::Answered(
+                pyrographer_core::codec::rockusb::parse_capability(&[0, 1, 0, 0, 0, 0, 0, 0])
+                    .expect("eight bytes"),
+            ),
+            flash: FlashInfo {
+                size_bytes: 122_142_720 * 512,
+                sector_size: 512,
+                medium: None,
+                chip_id: None,
+            },
+            chip_version: vec![0x36, 0x37, 0x35, 0x33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            soc: Some(Soc::parse("rk3576").expect("pinned")),
+            read_back: ReadBack::PerWindow,
+        }
+    }
+
+    /// The firmware plan screen shows every run in the order it is written, the ID
+    /// block's images, the table afterward, what is left out, what the loader file
+    /// claims, what the loader can do, and the gate, before anything is agreed to.
+    #[test]
+    fn the_firmware_plan_screen_shows_every_run_and_both_gates() {
+        let mut app = an_app();
+        app.session.devices_seen(vec![a_device(12)], 0.0);
+        app.session.select_target(a_device(12), a_device(12));
+        app.session.pending = Some(Pending {
+            plan: Plan::Firmware(a_firmware_plan()),
+            confirmation: Confirmation::asked_of(ConfirmBy::Coordinate, &Chosen::Usb(a_device(12))),
+            refused: None,
+        });
+
+        let words = words(&mut app);
+        for wanted in [
+            "This overwrites flash",
+            "2207:350e",
+            "RK3576 by rockchip, version 1.2.3",
+            "replaces the board's",
+            "partition 'boot' from Image/boot.img",
+            "LBA 40960 through 43007",
+            "LBA 64 through 767",
+            "FlashBoost at sector 8, 8 sectors, loads at 0x3ffc0000",
+            "laid out by the FlashHead header, every hash checked",
+            "package-file: the entry is the packing tool's own list of files",
+            "(rk3576)",
+            "NEW_IDB set",
+            "rk3576: the loader's answer matches",
+        ] {
+            assert!(words.contains(wanted), "missing {wanted:?} in: {words}");
+        }
+    }
+
+    /// The firmware section is shut until it is asked for, and open it offers a
+    /// package write and an ID block write, each grayed until a file is chosen and
+    /// saying so.
+    #[test]
+    fn the_firmware_section_offers_a_package_and_an_id_block() {
+        let mut app = an_app();
+        let shut = drawn(|ui| firmware_tools(&mut app, ui, true, 0.0));
+        assert!(shut.contains("Firmware"), "shut, it names itself: {shut}");
+        assert!(!shut.contains("Plan firmware write"), "{shut}");
+
+        app.show_firmware_tools = true;
+        let words = drawn(|ui| firmware_tools(&mut app, ui, true, 0.0));
+        assert!(words.contains("Plan firmware write"), "{words}");
+        assert!(words.contains("Plan ID block write"), "{words}");
+
+        let tree = tree(|ui| firmware_tools(&mut app, ui, true, 0.0));
+        for (name, why) in [
+            ("Plan firmware write...", "Choose a firmware package first."),
+            ("Plan ID block write...", "Choose a loader first."),
+        ] {
+            let button = tree
+                .controls()
+                .into_iter()
+                .find(|node| tree.announced(node).as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is drawn"));
+            assert!(button.is_disabled(), "{name} waits for a file");
+            assert_eq!(button.description(), Some(why), "{name}");
+        }
+    }
+
+    /// On a board with no device-wide LBA space, the firmware section says it is
+    /// refused, in core's words, and grays both writes.
+    #[test]
+    fn the_firmware_section_on_a_board_with_no_device_wide_lba_space_is_refused() {
+        let mut app = an_app();
+        app.session.target.raw_lba_reason =
+            pyrographer_core::verbs::raw_lba_refusal(&a_dfu_board());
+        app.show_firmware_tools = true;
+
+        let words = drawn(|ui| firmware_tools(&mut app, ui, true, 0.0));
+        assert!(words.contains("Firmware writes are refused"), "{words}");
+        assert!(words.contains("named region"), "{words}");
+
+        let tree = tree(|ui| firmware_tools(&mut app, ui, true, 0.0));
+        let button = tree
+            .controls()
+            .into_iter()
+            .find(|node| tree.announced(node).as_deref() == Some("Plan firmware write..."))
+            .expect("drawn and grayed rather than hidden");
+        assert!(button.is_disabled());
+        assert!(
+            button
+                .description()
+                .is_some_and(|why| why.contains("named region"))
+        );
+    }
+
+    /// A firmware write's report says which kind of write it was.
+    #[test]
+    fn a_firmware_write_report_says_what_it_did() {
+        let package = drawn_report(&Report::FirmwareWritten {
+            id_block_only: false,
+            runs: 5,
+            bytes: 3 << 20,
+        });
+        assert!(
+            package.contains("Wrote the firmware package in 5 runs"),
+            "{package}"
+        );
+        let id_block = drawn_report(&Report::FirmwareWritten {
+            id_block_only: true,
+            runs: 1,
+            bytes: 704 * 512,
+        });
+        assert!(
+            id_block.contains("Wrote the ID block at sector 64"),
+            "{id_block}"
+        );
+    }
+
     /// The disk section is closed until it is opened.
     ///
     /// This is the window's form of `list` against `list --blocks`. A board is on
@@ -7057,6 +7602,8 @@ mod tests {
         app.show_console = true;
         app.console.show_uboot = true;
         app.author.show = true;
+        app.show_table_tools = true;
+        app.show_firmware_tools = true;
 
         let tree = tree(|ui| draw(&mut app, ui));
         let nameless: Vec<_> = tree
@@ -7295,6 +7842,8 @@ mod tests {
         app.show_console = true;
         app.console.show_uboot = true;
         app.author.show = true;
+        app.show_table_tools = true;
+        app.show_firmware_tools = true;
 
         let targets = aimed_at(&tree(|ui| draw(&mut app, ui)));
         assert!(

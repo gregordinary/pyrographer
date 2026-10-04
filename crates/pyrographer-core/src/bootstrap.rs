@@ -239,6 +239,7 @@ mod tests {
             chip: None,
             code_471: vec![blob("UsbHead", data_471.clone())],
             code_472: vec![blob("Loader", data_472.clone())],
+            flash_stages: Vec::new(),
             rc4_disabled: true,
         };
 
@@ -286,6 +287,7 @@ mod tests {
             chip: None,
             code_471: vec![blob("UsbHead", data)],
             code_472: vec![],
+            flash_stages: Vec::new(),
             rc4_disabled: true,
         };
 
@@ -391,6 +393,7 @@ mod tests {
             chip: None,
             code_471: vec![blob("UsbHead", vec![0u8; 32])],
             code_472: vec![],
+            flash_stages: Vec::new(),
             rc4_disabled: true,
         };
         // No scripted steps: a pre-canceled token must return before any control
@@ -411,6 +414,7 @@ mod tests {
             chip: None,
             code_471: vec![],
             code_472: vec![],
+            flash_stages: Vec::new(),
             rc4_disabled: true,
         };
         let mut transport = ScriptedTransport::new(vec![]);

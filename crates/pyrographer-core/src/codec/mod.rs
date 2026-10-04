@@ -29,8 +29,15 @@
 //!
 //! [`rkboot`] is the loader container `db` takes, and the payload the maskrom
 //! download-boot uploads from it: verbatim section bytes plus a trailing CRC-16.
-//! [`rc4`] is Rockchip's on-flash ID-block scramble, kept as a pinned protocol
-//! fact. The upload does not use it.
+//! The upload sends stored bytes, and does not use [`rc4`].
+//!
+//! # The ID block and the firmware package
+//!
+//! [`idb`] lays out the ID block a BootROM reads from sector 64, from a loader
+//! container's flash stages. It unscrambles them with [`rc4`], places each image
+//! where its `RKNS` header says, and checks every [`sha256`] the header records.
+//! [`rkfw`] is the firmware package an SDK build ends in (`update.img`): an `RKFW`
+//! header around an `RKAF` archive of partition images.
 //!
 //! [`ingenic_boot`] is the XBurst boot ROM's `VR_*` vendor command layer. Its six
 //! endpoint-0 control requests upload a DRAM-init stage and a DFU-capable U-Boot
@@ -55,9 +62,10 @@
 //! # Checksums
 //!
 //! [`crc`] is the checksum arithmetic for the on-flash tables, the maskrom payload,
-//! and the StarFive header and blocks. Its four checksums are defined together
-//! because they are easy to confuse. Two CRC-32s have polynomials one bit apart, and
-//! two CRC-16s differ only in their seed.
+//! the firmware package's archive, and the StarFive header and blocks. Its four
+//! checksums are defined together because they are easy to confuse. Two CRC-32s
+//! have polynomials one bit apart, and two CRC-16s differ only in their seed.
+//! [`sha256`] is the hash an ID block's header names its images by.
 
 pub mod bot;
 pub mod console;
@@ -65,10 +73,13 @@ pub mod crc;
 pub mod dfu;
 pub mod dfu_alt;
 pub mod gpt;
+pub mod idb;
 pub mod ingenic_boot;
 pub mod rc4;
 pub mod rkboot;
+pub mod rkfw;
 pub mod rkparam;
 pub mod rockusb;
+pub mod sha256;
 pub mod splhdr;
 pub mod xmodem;

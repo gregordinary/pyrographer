@@ -16,10 +16,18 @@
 //! `agent`'s own tests spell some conversations out byte by byte, deliberately,
 //! because those tests pin the wire format. A test that compared a CBW with one
 //! built by the same code would assert nothing.
+//!
+//! The firmware fixtures at the end build files rather than conversations. One is a
+//! loader container with an ID block in it, and another a firmware package around
+//! it. They write every offset as a number of their own, not the codecs' constants.
+//! A codec that read a field from the wrong place therefore fails against them.
 
 use crate::codec::bot::{self, Direction};
+use crate::codec::crc::crc32_rockchip;
 use crate::codec::dfu::{self, Functional};
+use crate::codec::rc4::{MASKROM_RC4_KEY, rc4};
 use crate::codec::rockusb::{self, Opcode};
+use crate::codec::sha256::sha256;
 use crate::codec::{gpt, rkparam};
 use crate::transport::testing::Step;
 
@@ -490,4 +498,199 @@ pub fn param_block(text: &str) -> Vec<u8> {
     block.extend_from_slice(&crate::codec::crc::crc32_rockchip(text).to_le_bytes());
     block.resize(block.len().next_multiple_of(512), 0);
     block
+}
+
+/// One entry of a firmware package [`firmware_package`] builds: its name, its path,
+/// and its bytes.
+pub struct PackageEntry<'a> {
+    /// The entry's name: a partition's, or a role such as `parameter`.
+    pub name: &'a str,
+    /// The path the packing tool took it from.
+    pub path: &'a str,
+    /// The entry's bytes.
+    pub data: Vec<u8>,
+}
+
+/// A firmware package: the 102-byte `RKFW` header, `loader`, an `RKAF` archive of
+/// `entries` with its checksum, and a 32-byte trailer.
+///
+/// The header names version 1.2.3, a release on 2026-10-04, and the family byte
+/// `0x38` in its chip field.
+pub fn firmware_package(loader: &[u8], entries: &[PackageEntry<'_>]) -> Vec<u8> {
+    let archive = rkaf_archive(entries);
+    let header_len = 102;
+    let loader_offset = header_len;
+    let archive_offset = loader_offset + loader.len();
+
+    let mut file = vec![0u8; header_len];
+    file[..4].copy_from_slice(b"RKFW");
+    file[4..6].copy_from_slice(&(header_len as u16).to_le_bytes());
+    file[6..10].copy_from_slice(&0x0102_0003u32.to_le_bytes()); // version
+    file[14..16].copy_from_slice(&2026u16.to_le_bytes()); // release year
+    file[16..21].copy_from_slice(&[10, 4, 12, 30, 0]); // month, day, h, m, s
+    file[21..25].copy_from_slice(&[0x38, 0, 0, 0]); // chip
+    for (at, value) in [
+        (25, loader_offset),
+        (29, loader.len()),
+        (33, archive_offset),
+        (37, archive.len()),
+    ] {
+        file[at..at + 4].copy_from_slice(&(value as u32).to_le_bytes());
+    }
+
+    file.extend_from_slice(loader);
+    file.extend_from_slice(&archive);
+    file.extend_from_slice(b"0123456789abcdef0123456789abcdef");
+    file
+}
+
+/// An `RKAF` archive of `entries`, each placed after the 2048-byte header in order
+/// and padded to 2048 bytes, followed by Rockchip's CRC-32 over all of it.
+pub fn rkaf_archive(entries: &[PackageEntry<'_>]) -> Vec<u8> {
+    let mut archive = vec![0u8; 2048];
+    archive[..4].copy_from_slice(b"RKAF");
+    archive[8..14].copy_from_slice(b"RK3576"); // model
+    archive[72..80].copy_from_slice(b"rockchip"); // manufacturer
+    archive[132..136].copy_from_slice(&0x0100_0000u32.to_le_bytes()); // version
+    archive[136..140].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    for (index, entry) in entries.iter().enumerate() {
+        let position = archive.len();
+        let at = 140 + index * 112;
+        archive[at..at + entry.name.len()].copy_from_slice(entry.name.as_bytes());
+        archive[at + 32..at + 32 + entry.path.len()].copy_from_slice(entry.path.as_bytes());
+        let fields = [
+            (96, position as u32),                                 // position
+            (100, 0xffff_ffff),                                    // NAND address
+            (104, entry.data.len().next_multiple_of(2048) as u32), // padded size
+            (108, entry.data.len() as u32),                        // size
+        ];
+        for (offset, value) in fields {
+            archive[at + offset..at + offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        archive.extend_from_slice(&entry.data);
+        archive.resize(archive.len().next_multiple_of(2048), 0);
+    }
+
+    let length = archive.len() as u32;
+    archive[4..8].copy_from_slice(&length.to_le_bytes());
+    let crc = crc32_rockchip(&archive);
+    archive.extend_from_slice(&crc.to_le_bytes());
+    archive
+}
+
+/// An RKBOOT loader container whose flash stages build a small ID block.
+///
+/// Its `RKNS` header places one image of eight sectors at sector 8, so the ID block
+/// is 16 sectors. Both stages are stored scrambled per 512-byte block, with the RC4
+/// flag set, as an RK3576 container stores its own. The chip field reads `"6753"`,
+/// the RK3576's. It has no 471 or 472 stage, so it uploads nothing.
+pub fn loader_container() -> Vec<u8> {
+    let image: Vec<u8> = (0..8 * 512).map(|i| (i % 253) as u8).collect();
+    let mut head = vec![0u8; 8 * 512];
+    head[..4].copy_from_slice(b"RKNS");
+    head[8..12].copy_from_slice(&(384u32 | 1 << 16).to_le_bytes()); // 1536 hashed, 1 image
+    head[12..16].copy_from_slice(&1u32.to_le_bytes()); // SHA-256
+    head[120..124].copy_from_slice(&(8u32 | 8 << 16).to_le_bytes()); // sector 8, 8 sectors
+    head[124..128].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // no load address
+    head[144..176].copy_from_slice(&sha256(&image));
+    let digest = sha256(&head[..1536]);
+    head[1536..1568].copy_from_slice(&digest);
+
+    let scramble = |plain: &[u8]| -> Vec<u8> {
+        plain
+            .chunks(512)
+            .flat_map(|block| rc4(&MASKROM_RC4_KEY, block))
+            .collect()
+    };
+    let stages = [
+        ("FlashHead", scramble(&head)),
+        ("FlashData", scramble(&image)),
+    ];
+
+    // A 45-byte header, an empty 471 and 472 table, a stage table of two 57-byte
+    // entries, then the stages.
+    let table = 45;
+    let mut file = vec![0u8; table + 2 * 57];
+    file[..4].copy_from_slice(b"LDR ");
+    file[21..25].copy_from_slice(b"6753");
+    file[37] = 2; // stage count
+    file[38..42].copy_from_slice(&(table as u32).to_le_bytes());
+    file[42] = 57; // stage entry size
+    file[44] = 1; // RC4 disabled: the flash holds plaintext
+    for (index, (name, data)) in stages.iter().enumerate() {
+        let entry = table + index * 57;
+        file[entry] = 57;
+        for (u, unit) in name.encode_utf16().enumerate() {
+            file[entry + 5 + 2 * u..entry + 7 + 2 * u].copy_from_slice(&unit.to_le_bytes());
+        }
+        let offset = file.len() as u32;
+        file[entry + 45..entry + 49].copy_from_slice(&offset.to_le_bytes());
+        file[entry + 49..entry + 53].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        file.extend_from_slice(data);
+    }
+    file
+}
+
+/// A GPT parameter block like an RK3576 SDK's, reduced: three partitions from
+/// sector `0x4000`, the last growing, and `rootfs` pinned to a GUID.
+pub fn sdk_parameter() -> Vec<u8> {
+    param_block(
+        "FIRMWARE_VER: 1.0\nMACHINE_MODEL: RK3576\nTYPE: GPT\nCMDLINE: \
+         mtdparts=rk29xxnand:0x00002000@0x00004000(uboot),0x00010000@0x00006000(boot),\
+         -@0x00016000(rootfs:grow)\nuuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9\n",
+    )
+}
+
+/// A firmware package for a board: [`loader_container`], [`sdk_parameter`], the
+/// loader again as `bootloader`, a `uboot` and a `boot` image, and the packing
+/// tool's list.
+pub fn firmware_package_for_a_board() -> Vec<u8> {
+    package_around(sdk_parameter())
+}
+
+/// A firmware package small enough for a 4 MiB disk. It is
+/// [`firmware_package_for_a_board`] with a parameter whose partitions begin at
+/// sector `0x800`, and whose `rootfs` grows from sector `0x1000`.
+pub fn firmware_package_for_a_small_disk() -> Vec<u8> {
+    package_around(param_block(
+        "TYPE: GPT\nCMDLINE: mtdparts=rk29xxnand:0x00000400@0x00000800(uboot),\
+         0x00000400@0x00000c00(boot),-@0x00001000(rootfs:grow)\n\
+         uuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9\n",
+    ))
+}
+
+/// The package both fixtures above build, around `parameter`.
+fn package_around(parameter: Vec<u8>) -> Vec<u8> {
+    let loader = loader_container();
+    firmware_package(
+        &loader,
+        &[
+            PackageEntry {
+                name: "package-file",
+                path: "package-file",
+                data: b"# list\n".to_vec(),
+            },
+            PackageEntry {
+                name: "parameter",
+                path: "Image/parameter.txt",
+                data: parameter,
+            },
+            PackageEntry {
+                name: "bootloader",
+                path: "Image/MiniLoaderAll.bin",
+                data: loader.clone(),
+            },
+            PackageEntry {
+                name: "uboot",
+                path: "Image/uboot.img",
+                data: vec![0x55; 5000],
+            },
+            PackageEntry {
+                name: "boot",
+                path: "Image/boot.img",
+                data: vec![0x66; 3000],
+            },
+        ],
+    )
 }

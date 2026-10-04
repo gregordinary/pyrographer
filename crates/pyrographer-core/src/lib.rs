@@ -18,6 +18,9 @@
 //! time. Every byte layout on the wire or on the flash is a sans-I/O codec in
 //! [`codec`].
 //!
+//! [`firmware`] reads a Rockchip firmware package (`update.img`) in one forward
+//! pass, checks it, and hands the verbs what a write of it needs.
+//!
 //! Two serial drivers have no `FlashAgent`. [`recovery`] is StarFive's write-only
 //! recovery, with a verb of its own. [`console`] watches a serial console, and
 //! [`uboot`] drives a U-Boot prompt through it. That prompt is where a maskrom
@@ -78,6 +81,7 @@ pub mod console;
 pub mod discovery;
 pub mod error;
 pub mod fill;
+pub mod firmware;
 pub mod image;
 pub mod layout;
 pub mod partition;

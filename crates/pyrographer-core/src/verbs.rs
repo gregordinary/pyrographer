@@ -64,14 +64,17 @@ use crate::bootstrap;
 use crate::bootstrap::ingenic::IngenicLoader;
 use crate::codec::crc::crc32;
 use crate::codec::gpt;
+use crate::codec::idb::{self, IdbImage};
 use crate::codec::ingenic_boot::CpuInfo;
 use crate::codec::rkboot::LoaderImage;
+use crate::codec::rkfw;
 use crate::codec::rkparam;
 use crate::codec::rockusb;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::discovery::{self, DeviceInfo};
 use crate::fill::{FillReport, FillScanner};
-use crate::image::{ImageReader, ImageWriter, SyncReader};
+use crate::firmware::{self, ForwardReader, Package};
+use crate::image::{BoxFuture, ImageReader, ImageWriter, SyncReader};
 use crate::layout::Layout;
 use crate::partition::{
     self, GptRepair, GptRepairDirection, Overlap, ParamRepair, Partition, PartitionTable,
@@ -227,8 +230,14 @@ pub async fn download_boot<T: Transport>(
 /// [`download_boot`] enforces this answer by calling this function, so what a
 /// front-end shows and what the upload does cannot differ.
 pub fn loader_blob_refusal(soc: Option<Soc>, loader: &LoaderImage) -> Option<Error> {
+    container_claim_refusal(soc, loader.chip)
+}
+
+/// [`loader_blob_refusal`] over the container's claim alone, so a firmware plan,
+/// which keeps the claim and not the container, judges it the same way.
+fn container_claim_refusal(soc: Option<Soc>, chip: Option<[u8; 4]>) -> Option<Error> {
     let soc = soc?;
-    let chip = loader.chip?;
+    let chip = chip?;
     match soc.claimed_by_container(&chip) {
         Some(true) | None => None,
         Some(false) => Some(Error::LoaderBlobMismatch {
@@ -863,26 +872,100 @@ pub async fn flash<T: Transport>(
     cancel: &Cancel,
 ) -> Result<()> {
     loader_match(agent, write.plan())?;
+    let plan = write.plan();
+
+    // The image's first bytes, judged before anything is written. A container a
+    // tool unpacks is refused here by the same function a front-end asks, and the
+    // bytes read to judge it go to the flash first, so nothing is read twice.
+    let head_len = plan.image_bytes.min(CONTAINER_MAGIC_LEN as u64) as usize;
+    let mut head = [0u8; CONTAINER_MAGIC_LEN];
+    image
+        .read_exact(&mut head[..head_len])
+        .await
+        .map_err(|e| Error::Io(format!("cannot read the image at byte 0: {}", cause(e))))?;
+    if let Some(refusal) = image_refusal(&head[..head_len]) {
+        return Err(refusal);
+    }
+    let mut image = Replayed {
+        head: &head[..head_len],
+        rest: image,
+    };
+
     // ...and again on the loader actually in hand, in case it is not the one that
     // planned. One read command before the first window.
-    reverify_loader(agent, write.plan()).await?;
+    reverify_loader(agent, plan).await?;
     // The source names no device, so nothing constrains its transport parameter
     // and it is named here. `T` is as good as any type: `ImageSource::Local`
     // holds no agent, so no value of it is ever built. Its fill report is empty
     // by construction -- a local image crosses no transport -- so it is dropped:
     // a flash reads back the destination, and the source it wrote from is a file.
-    let plan = write.plan();
     write_verified::<T, T>(
         agent,
         plan.lba,
         plan.image_bytes,
         plan.sectors,
-        ImageSource::Local(image),
+        ImageSource::Local(&mut image),
         progress,
         cancel,
     )
     .await?;
     Ok(())
+}
+
+/// How many of an image's first bytes [`image_refusal`] judges.
+pub const CONTAINER_MAGIC_LEN: usize = 4;
+
+/// Why an image that begins with `first` would be refused, or `None`.
+///
+/// A Rockchip firmware package, its `RKAF` archive and an RKBOOT loader container
+/// are each a container a tool unpacks. Written raw, none of them boots, and the
+/// write would have replaced whatever was there with something that cannot run.
+/// `first` is the image's first [`CONTAINER_MAGIC_LEN`] bytes. An ID block, which
+/// begins `RKNS`, is written raw at sector 64 and is not refused.
+///
+/// [`flash`] enforces this answer on the image it is given, through this function,
+/// before a byte goes out. A front-end asks it of a file's first bytes before it
+/// plans. A person is then not asked to confirm a write that will be refused.
+pub fn image_refusal(first: &[u8]) -> Option<Error> {
+    let container = rkfw::identify(first)?;
+    let unpack = match container {
+        rkfw::Container::Package | rkfw::Container::Archive => {
+            "A package is written as a whole: its partition images, its partition table and its \
+             ID block, each where it belongs"
+        }
+        rkfw::Container::Loader => {
+            "Its flash stages are laid out as an ID block, written at sector 64, and its USB \
+             stages are uploaded to a board in maskrom"
+        }
+    };
+    Some(Error::InvalidRequest(format!(
+        "the image is {}, which a tool unpacks before anything of it goes to the flash. Written \
+         raw, it does not boot. {unpack}",
+        container.describe()
+    )))
+}
+
+/// An image whose first bytes were already read, read again from the start.
+///
+/// [`flash`] reads an image's first bytes to judge them, and the image seam has no
+/// way back. This serves those bytes first, then the rest of the image.
+struct Replayed<'a, 'b> {
+    head: &'a [u8],
+    rest: &'b mut dyn ImageReader,
+}
+
+impl ImageReader for Replayed<'_, '_> {
+    fn read_exact<'c>(&'c mut self, buf: &'c mut [u8]) -> BoxFuture<'c, Result<()>> {
+        Box::pin(async move {
+            let from_head = self.head.len().min(buf.len());
+            buf[..from_head].copy_from_slice(&self.head[..from_head]);
+            self.head = &self.head[from_head..];
+            if from_head < buf.len() {
+                self.rest.read_exact(&mut buf[from_head..]).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Why a write to this device would be refused before a plan exists, or `None`.
@@ -2569,6 +2652,565 @@ pub async fn write_table<T: Transport>(
     reverify_loader_soc(agent, plan.soc).await?;
 
     write_segments(agent, &plan.segments, progress, cancel).await
+}
+
+/// What a firmware write lays down, in full, before any of it happens.
+///
+/// It is the plan for writing a Rockchip firmware package ([`plan_firmware`]), or a
+/// loader's ID block alone ([`plan_write_id_block`]). A package write lays down
+/// many runs under one consent: every partition image, a fresh GPT, and the ID
+/// block. Each run is written and read back window by window, by the loop every
+/// write shares. The first window that fails stops the whole write there.
+///
+/// It carries the loader evidence the wrong-loader gate compares, as [`WritePlan`]
+/// does. It also carries two answers that gate an ID block. One is the loader
+/// container's own claim about its SoC, and the other is the running loader's
+/// capability reply. [`firmware_refusal`] asks all of them, and [`write_firmware`]
+/// enforces the same answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirmwarePlan {
+    /// What is being written.
+    pub what: FirmwareWrite,
+    /// The runs, in the order the write lays them down.
+    pub runs: Vec<Run>,
+    /// The partitions the device's table holds once the write is done.
+    ///
+    /// For a package, these are the parameter's, and the write lays the table down.
+    /// For an ID block alone, they are the device's own, which the write leaves as
+    /// they are.
+    pub partitions: Vec<Partition>,
+    /// The package's entries the write does not lay down, each with the reason.
+    pub skipped: Vec<firmware::Skipped>,
+    /// The flash stage the ID block's `RKNS` header came from.
+    pub id_block_header: String,
+    /// The images the ID block holds, as its header lists them.
+    pub id_block_images: Vec<IdbImage>,
+    /// The loader container's own claim about which SoC it was built for, raw.
+    ///
+    /// [`loader_blob_refusal`] judges a container's claim before an upload. A
+    /// firmware plan judges it the same way, before the ID block built from that
+    /// container is written.
+    pub loader_chip: Option<[u8; 4]>,
+    /// What the running loader said it can do, as far as an ID block is concerned.
+    pub capability: LoaderCapability,
+    /// The geometry of the flash, as the device reports it.
+    pub flash: FlashInfo,
+    /// The loader's raw answer to which SoC it is on. The wrong-loader gate
+    /// compares it, as it compares [`WritePlan::chip_version`].
+    pub chip_version: Vec<u8>,
+    /// The SoC the caller named this write for, or `None`.
+    pub soc: Option<Soc>,
+    /// When the write is proved to have landed, in the backend's own words.
+    pub read_back: ReadBack,
+}
+
+/// What a [`FirmwarePlan`] writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirmwareWrite {
+    /// A whole firmware package: its partition images, a GPT from its parameter,
+    /// and the ID block from its loader.
+    Package {
+        /// The board model the package names.
+        model: String,
+        /// The manufacturer the package names.
+        manufacturer: String,
+        /// The package's version, as stored.
+        /// [`version_text`](rkfw::version_text) renders it.
+        version: u32,
+    },
+    /// A loader's ID block alone, at sector 64, with the partition table left as
+    /// it is.
+    IdBlock,
+}
+
+/// One contiguous run a [`FirmwarePlan`] lays down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    /// What the run is, in words for a person, such as "partition 'boot' from
+    /// Image/boot.img".
+    pub what: String,
+    /// The first sector it lands on.
+    pub lba: u64,
+    /// How many bytes it writes, before the last sector is padded.
+    pub bytes: u64,
+    /// How many sectors it touches, padding included.
+    pub sectors: u64,
+    /// Where its bytes come from.
+    pub source: RunSource,
+    /// Which of the resulting table's partitions the run lands in.
+    pub touches: Touches,
+}
+
+/// Where a [`Run`]'s bytes come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunSource {
+    /// Bytes the plan holds: a GPT copy, or the ID block. They are small and travel
+    /// with the plan, so what lands is exactly what a person saw.
+    Held(Vec<u8>),
+    /// A range of the firmware package, streamed from the file as the write runs.
+    /// A partition image is gigabytes and is never held.
+    Package {
+        /// Where the range begins, counted from the start of the file.
+        offset: u64,
+    },
+}
+
+/// What the running loader said it can do, as far as writing an ID block goes.
+///
+/// Rockchip's rkdeveloptool writes an `RKNS` ID block only through a loader that
+/// claims `NEW_IDB`. That is byte 1 bit 0 of the `K_FW_READ_CAPABILITY` reply, and
+/// the tool refuses the write without it. **\[DOC\]**
+///
+/// [`firmware_refusal`] asks the same question, and refuses on the same answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoaderCapability {
+    /// The device runs no loader, so there is nothing to ask. A block device is one.
+    NoLoader,
+    /// The loader answered.
+    Answered(rockusb::Capability),
+    /// The loader failed the query, with the reason. The agent is still in step
+    /// with the device.
+    NotAnswered(String),
+}
+
+impl FirmwarePlan {
+    /// Confirm this plan.
+    ///
+    /// It consumes the plan, so one confirmation permits one write.
+    pub fn confirm(self) -> ConfirmedFirmwareWrite {
+        ConfirmedFirmwareWrite(self)
+    }
+
+    /// The bytes every run writes, together.
+    pub fn total_bytes(&self) -> u64 {
+        self.runs.iter().map(|run| run.bytes).sum()
+    }
+
+    /// Whether a run streams from the package, so the write needs the file again.
+    pub fn needs_package(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| matches!(run.source, RunSource::Package { .. }))
+    }
+}
+
+/// A [`FirmwarePlan`] a caller has agreed to, and the only thing [`write_firmware`]
+/// takes.
+// Not `Clone`, for the reason [`ConfirmedWrite`] is not: one yes, one write.
+#[derive(Debug)]
+pub struct ConfirmedFirmwareWrite(FirmwarePlan);
+
+impl ConfirmedFirmwareWrite {
+    /// The plan that was confirmed.
+    pub fn plan(&self) -> &FirmwarePlan {
+        &self.0
+    }
+}
+
+/// Plan writing the firmware `package` to the device: the dry run.
+///
+/// It reads the device's geometry, the loader's account of itself, and the
+/// loader's capability reply. It sends nothing that changes the device. From the
+/// package it lays out the runs, in the order [`write_firmware`] writes them:
+///
+/// 1. Every partition image, aimed at the partition the parameter names for it, in
+///    the order the file holds them. The write streams them from the file, which
+///    reads forward and never seeks, so the order is the file's.
+/// 2. The primary GPT and the backup, authored from the parameter by
+///    [`Package::layout`] and [`author_gpt`].
+/// 3. The ID block, at sector 64, last.
+///
+/// Each of these is refused here, before anything is confirmed:
+///
+/// - A device with no device-wide LBA space, as [`raw_lba_refusal`] describes, or
+///   one whose sectors are not 512 bytes, which every offset in a package counts
+/// - A parameter that is not a GPT one, or a layout the device cannot hold
+/// - An image entry that names no partition, or that is larger than its partition
+/// - Two runs that overlap, and an ID block that lands inside a partition
+pub async fn plan_firmware<T: Transport>(
+    agent: &mut FlashAgent<T>,
+    package: &Package,
+    soc: Option<Soc>,
+) -> Result<FirmwarePlan> {
+    firmware_needs_raw_lba(agent)?;
+    firmware_needs_512_byte_sectors(agent)?;
+    let read_back = agent.read_back();
+    let ceiling = agent.address_ceiling();
+    let flash = agent.info().await?;
+    let chip_version = agent.chip_version().await?;
+    let capability = ask_capability(agent).await?;
+    let flash_sectors = flash.size_bytes / u64::from(flash.sector_size);
+
+    let layout = package.layout(flash_sectors)?;
+    let authored = author_gpt(&layout, flash_sectors, firmware::SECTOR_LEN as usize)?;
+    let partitions = layout.as_partitions();
+    let table = Table::Read(PartitionTable {
+        format: TableFormat::Gpt,
+        partitions: partitions.clone(),
+        recovery: None,
+    });
+    let resulting = table.require()?;
+
+    let mut runs = Vec::with_capacity(package.images.len() + 3);
+    for image in &package.images {
+        let partition = resulting.find(&image.name).map_err(|_| {
+            Error::InvalidRequest(format!(
+                "firmware package: entry '{}' ({}) names no partition in the package's parameter, \
+                 so it has nowhere to go. Its partitions are {}",
+                image.name,
+                image.path,
+                resulting.names().join(", ")
+            ))
+        })?;
+        partition.must_hold(image.bytes, flash.sector_size)?;
+        runs.push(run(
+            format!("partition '{}' from {}", image.name, image.path),
+            partition.first_lba,
+            image.bytes,
+            RunSource::Package {
+                offset: image.offset,
+            },
+            &flash,
+            &table,
+            ceiling,
+        )?);
+    }
+    runs.push(run(
+        "the primary GPT (protective MBR, header, and entry array from sector 0)".to_string(),
+        authored.primary.lba,
+        authored.primary.bytes.len() as u64,
+        RunSource::Held(authored.primary.bytes),
+        &flash,
+        &table,
+        ceiling,
+    )?);
+    runs.push(run(
+        "the backup GPT in the device's last sectors".to_string(),
+        authored.backup.lba,
+        authored.backup.bytes.len() as u64,
+        RunSource::Held(authored.backup.bytes),
+        &flash,
+        &table,
+        ceiling,
+    )?);
+    runs.push(id_block_run(&package.id_block, &flash, &table, ceiling)?);
+    runs_apart(&runs)?;
+
+    Ok(FirmwarePlan {
+        what: FirmwareWrite::Package {
+            model: package.archive.model.clone(),
+            manufacturer: package.archive.manufacturer.clone(),
+            version: package.header.version,
+        },
+        runs,
+        partitions,
+        skipped: package.skipped.clone(),
+        id_block_header: package.id_block.header_stage.clone(),
+        id_block_images: package.id_block.images.clone(),
+        loader_chip: package.loader.chip,
+        capability,
+        flash,
+        chip_version,
+        soc,
+        read_back,
+    })
+}
+
+/// Plan writing the ID block built from `loader` at sector 64, and nothing else:
+/// the dry run.
+///
+/// It is pyrographer's form of rkdeveloptool's `ul`. The block is laid out from the
+/// container's `RKNS` header and checked against every hash it records, as [`idb`]
+/// describes. The block written is therefore the one its header describes. The
+/// device's partition table is read so the plan can say the block lands in no
+/// partition, and is left as it is. A block that would land inside a partition is
+/// refused.
+pub async fn plan_write_id_block<T: Transport>(
+    agent: &mut FlashAgent<T>,
+    loader: &LoaderImage,
+    soc: Option<Soc>,
+) -> Result<FirmwarePlan> {
+    firmware_needs_raw_lba(agent)?;
+    firmware_needs_512_byte_sectors(agent)?;
+    let id_block = idb::build(loader)?;
+    let read_back = agent.read_back();
+    let ceiling = agent.address_ceiling();
+    let (flash, chip_version, table) = survey(agent).await?;
+    let capability = ask_capability(agent).await?;
+
+    let partitions = match &table {
+        Table::Read(read) => read.partitions.clone(),
+        Table::Absent | Table::Damaged { .. } => Vec::new(),
+    };
+    let runs = vec![id_block_run(&id_block, &flash, &table, ceiling)?];
+
+    Ok(FirmwarePlan {
+        what: FirmwareWrite::IdBlock,
+        runs,
+        partitions,
+        skipped: Vec::new(),
+        id_block_header: id_block.header_stage,
+        id_block_images: id_block.images,
+        loader_chip: loader.chip,
+        capability,
+        flash,
+        chip_version,
+        soc,
+        read_back,
+    })
+}
+
+/// Why this planned firmware write would be refused, plan in hand, or `None`.
+///
+/// It asks, in order:
+///
+/// 1. The wrong-loader gate, as [`plan_refusal`] asks it of a [`WritePlan`].
+/// 2. Whether the loader container claims the SoC the caller named, as
+///    [`loader_blob_refusal`] asks it before an upload. The ID block is built from
+///    that container, and the wrong one writes another SoC's first stage.
+/// 3. Whether the running loader claims `NEW_IDB`, as the reference tool asks
+///    before it writes an `RKNS` ID block. A loader that answers without it, or
+///    fails the query, is refused. A device that runs no loader is not asked.
+///
+/// [`write_firmware`] enforces this answer through this function, so the refusal a
+/// person is shown and the refusal the write makes cannot differ.
+pub fn firmware_refusal<T: Transport>(agent: &FlashAgent<T>, plan: &FirmwarePlan) -> Option<Error> {
+    if let Some(refusal) = loader_refusal(agent, plan.soc, &plan.chip_version) {
+        return Some(refusal);
+    }
+    if let Some(refusal) = container_claim_refusal(plan.soc, plan.loader_chip) {
+        return Some(refusal);
+    }
+    match &plan.capability {
+        LoaderCapability::NoLoader => None,
+        LoaderCapability::Answered(capability) if capability.new_idb() => None,
+        LoaderCapability::Answered(_) => Some(Error::InvalidRequest(
+            "the running loader's capability reply does not set NEW_IDB, and an RKNS ID block is \
+             written only through a loader that claims it. Rockchip's own tool refuses the same \
+             write for the same reason"
+                .to_string(),
+        )),
+        LoaderCapability::NotAnswered(why) => Some(Error::InvalidRequest(format!(
+            "the running loader did not answer the capability query ({why}), so it has not \
+             claimed NEW_IDB. An RKNS ID block is written only through a loader that claims it"
+        ))),
+    }
+}
+
+/// Write a confirmed firmware plan, and read back every window it writes.
+///
+/// It runs the same write path as every other destructive verb. Its gate is
+/// [`firmware_refusal`], enforced here, and the loader in hand is asked again for
+/// its SoC before the first window. Each run goes through the loop every write
+/// shares, so each is read back exactly as a single image is. The first window that
+/// fails stops the whole write there. Nothing is retried and nothing is
+/// rolled back, as [`flash`] explains.
+///
+/// `package` is the firmware package the plan was made from, read again from its
+/// first byte. The partition images stream from it, forward. A plan that writes an
+/// ID block alone needs none, and takes `None`. Progress covers every run as one
+/// write.
+pub async fn write_firmware<T: Transport>(
+    agent: &mut FlashAgent<T>,
+    confirmed: ConfirmedFirmwareWrite,
+    package: Option<&mut dyn ImageReader>,
+    progress: ProgressSink<'_>,
+    cancel: &Cancel,
+) -> Result<()> {
+    let plan = confirmed.plan();
+    firmware_needs_raw_lba(agent)?;
+    if let Some(refusal) = firmware_refusal(agent, plan) {
+        return Err(refusal);
+    }
+    if plan.needs_package() && package.is_none() {
+        return Err(Error::InvalidRequest(
+            "this plan streams partition images from a firmware package, and no package was \
+             given to the write"
+                .to_string(),
+        ));
+    }
+    reverify_loader_soc(agent, plan.soc).await?;
+
+    let total_bytes = plan.total_bytes();
+    progress(Progress::Started { total_bytes });
+
+    let mut reader = package.map(ForwardReader::new);
+    let mut done_before = 0u64;
+    for run in &plan.runs {
+        let mut advanced = |done| {
+            progress(Progress::Advanced {
+                done_bytes: done_before + done,
+                total_bytes,
+            })
+        };
+        match &run.source {
+            RunSource::Held(bytes) => {
+                let mut image = SyncReader::new(bytes.as_slice());
+                write_windows::<T, T>(
+                    agent,
+                    run.lba,
+                    run.bytes,
+                    run.sectors,
+                    ImageSource::Local(&mut image),
+                    &mut advanced,
+                    cancel,
+                )
+                .await?;
+            }
+            RunSource::Package { offset } => {
+                // Checked before the gate; the plan's runs are its own.
+                let Some(reader) = reader.as_mut() else {
+                    unreachable!("a plan that streams from the package was given one");
+                };
+                reader.skip_to(*offset).await?;
+                write_windows::<T, T>(
+                    agent,
+                    run.lba,
+                    run.bytes,
+                    run.sectors,
+                    ImageSource::Local(reader),
+                    &mut advanced,
+                    cancel,
+                )
+                .await?;
+            }
+        }
+        done_before += run.bytes;
+    }
+
+    progress(Progress::Finished {
+        done_bytes: total_bytes,
+    });
+    Ok(())
+}
+
+/// Refuse a firmware write on a device with no device-wide LBA space.
+fn firmware_needs_raw_lba<T: Transport>(agent: &FlashAgent<T>) -> Result<()> {
+    match raw_lba_refusal(agent) {
+        Some(why) => Err(Error::InvalidRequest(format!(
+            "{why}. Firmware lays a partition table and an ID block at fixed sectors of a \
+             device-wide LBA space, so this board has nowhere to write them"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a firmware write on a device whose sectors are not 512 bytes.
+///
+/// An `mtdparts` list counts 512-byte sectors, and so does an ID block, and the
+/// BootROM reads the ID block from byte 32768. On a device with larger sectors,
+/// every one of those numbers would land somewhere else.
+fn firmware_needs_512_byte_sectors<T: Transport>(agent: &FlashAgent<T>) -> Result<()> {
+    let sector = agent.sector_size();
+    if sector != firmware::SECTOR_LEN {
+        return Err(Error::InvalidRequest(format!(
+            "this device's sectors are {sector} bytes. Firmware counts 512-byte sectors, in its \
+             partition offsets and its ID block, so on this device each would land somewhere \
+             else"
+        )));
+    }
+    Ok(())
+}
+
+/// Ask the running loader what it can do, keeping a failed query as an answer.
+///
+/// A loader that fails the query and stays in step with the device is an answer:
+/// [`firmware_refusal`] refuses on it. A query that leaves the agent out of step is
+/// a failure of the plan itself, and is returned as one.
+async fn ask_capability<T: Transport>(agent: &mut FlashAgent<T>) -> Result<LoaderCapability> {
+    match agent.capability().await {
+        Ok(Some(capability)) => Ok(LoaderCapability::Answered(capability)),
+        Ok(None) => Ok(LoaderCapability::NoLoader),
+        Err(error) if !agent.is_desynchronized() => {
+            Ok(LoaderCapability::NotAnswered(error.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Build one [`Run`], with the geometry checks every write gets, and what it lands
+/// in from `table`.
+fn run(
+    what: String,
+    lba: u64,
+    bytes: u64,
+    source: RunSource,
+    flash: &FlashInfo,
+    table: &Table,
+    ceiling: AddressCeiling,
+) -> Result<Run> {
+    // The same pure `plan` every write is sized by, so a run gets exactly the range
+    // and ceiling checks a single write gets. The gate fields do not apply: a
+    // firmware write gates once, on the device.
+    let sized = plan(
+        lba,
+        bytes,
+        flash.clone(),
+        Vec::new(),
+        None,
+        table,
+        ReadBack::PerWindow,
+        ceiling,
+    )?;
+    Ok(Run {
+        what,
+        lba,
+        bytes,
+        sectors: sized.sectors,
+        source,
+        touches: sized.touches,
+    })
+}
+
+/// The ID block's run, at sector 64. A block that would land inside a partition is
+/// refused: the write would destroy what the partition holds, and the partition's
+/// next write would destroy the block.
+fn id_block_run(
+    id_block: &idb::IdBlock,
+    flash: &FlashInfo,
+    table: &Table,
+    ceiling: AddressCeiling,
+) -> Result<Run> {
+    let run = run(
+        format!(
+            "the ID block, {} images laid out by its RKNS header",
+            id_block.images.len()
+        ),
+        idb::LBA,
+        id_block.bytes.len() as u64,
+        RunSource::Held(id_block.bytes.clone()),
+        flash,
+        table,
+        ceiling,
+    )?;
+    if let Touches::Partitions(overlaps) = &run.touches
+        && let Some(first) = overlaps.first()
+    {
+        return Err(Error::InvalidRequest(format!(
+            "the ID block fills sectors {} to {}, and partition '{}' lies across them. The block \
+             belongs outside every partition",
+            idb::LBA,
+            idb::LBA + run.sectors - 1,
+            first.name
+        )));
+    }
+    Ok(run)
+}
+
+/// Refuse a plan whose runs overlap: one would overwrite another.
+fn runs_apart(runs: &[Run]) -> Result<()> {
+    let mut order: Vec<&Run> = runs.iter().collect();
+    order.sort_by_key(|run| run.lba);
+    for pair in order.windows(2) {
+        let (before, after) = (pair[0], pair[1]);
+        if after.lba < before.lba + before.sectors {
+            return Err(Error::InvalidRequest(format!(
+                "{} and {} overlap at sector {}, so one would overwrite the other",
+                before.what, after.what, after.lba
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// End a connected device's session the way `mode` asks for.
@@ -5531,6 +6173,290 @@ mod tests {
         ))
         .expect("both copies written and read back");
 
+        let FlashAgent::Rockusb(agent) = &agent else {
+            unreachable!("the test built a Rockusb agent")
+        };
+        agent.transport().assert_drained();
+    }
+
+    // A firmware package small enough for a scratch file.
+    fn a_small_package() -> Vec<u8> {
+        crate::testing::firmware_package_for_a_small_disk()
+    }
+
+    /// The sectors of the scratch disk a firmware test writes to: 4 MiB.
+    #[cfg(target_os = "linux")]
+    const FIRMWARE_DISK_SECTORS: u64 = 0x2000;
+
+    /// A whole package, planned and written onto a disk, lands where its parameter
+    /// says: each image in its partition, a GPT the codec reads back with the
+    /// pinned GUID and the growing partition ending at the last usable sector, and
+    /// an ID block at sector 64 that checks against its own header.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_firmware_package_lands_where_its_parameter_says_and_reads_back() {
+        let (path, mut agent) = a_block_agent("firmware", FIRMWARE_DISK_SECTORS);
+        let bytes = a_small_package();
+        let package = crate::firmware::tests::read_package(&bytes).expect("intact");
+
+        let plan = pollster::block_on(plan_firmware(&mut agent, &package, None))
+            .expect("a package that fits plans");
+        assert!(
+            firmware_refusal(&agent, &plan).is_none(),
+            "a disk has no loader to refuse"
+        );
+        assert_eq!(plan.capability, LoaderCapability::NoLoader);
+        let order: Vec<(u64, bool)> = plan
+            .runs
+            .iter()
+            .map(|run| (run.lba, matches!(run.source, RunSource::Package { .. })))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (0x800, true),
+                (0xc00, true),
+                (0, false),
+                (FIRMWARE_DISK_SECTORS - 33, false),
+                (64, false),
+            ],
+            "the images in file order, then both GPT copies, then the ID block last"
+        );
+        assert_eq!(plan.skipped.len(), 1, "the packing tool's list");
+
+        let mut source = SyncReader::new(bytes.as_slice());
+        pollster::block_on(write_firmware(
+            &mut agent,
+            plan.confirm(),
+            Some(&mut source),
+            &mut |_| {},
+            &Cancel::new(),
+        ))
+        .expect("the write lands and reads back");
+        drop(agent);
+
+        let disk = std::fs::read(&path).expect("the disk");
+        let at = |lba: u64| (lba * 512) as usize;
+        assert!(disk[at(0x800)..at(0x800) + 5000].iter().all(|&b| b == 0x55));
+        assert!(
+            disk[at(0x800) + 5000..at(0x800) + 5120]
+                .iter()
+                .all(|&b| b == 0),
+            "padding"
+        );
+        assert!(disk[at(0xc00)..at(0xc00) + 3000].iter().all(|&b| b == 0x66));
+
+        let id_block = &disk[at(64)..at(64) + package.id_block.bytes.len()];
+        assert_eq!(id_block, package.id_block.bytes.as_slice());
+        idb::check(id_block).expect("the ID block checks against its own header");
+
+        let header = gpt::parse_header(&disk[at(1)..at(2)]).expect("a primary GPT");
+        let entries = gpt::parse_entries(&header, &disk[at(2)..at(34)]).expect("its entry array");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["uboot", "boot", "rootfs"]);
+        assert_eq!(entries[2].last_lba, FIRMWARE_DISK_SECTORS - 34);
+        assert_eq!(
+            entries[2].unique_guid,
+            gpt::Guid::parse("614e0000-0000-4b53-8000-1d28000054a9").expect("a GUID")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An image larger than the partition its parameter names is refused at the
+    /// plan, before anything is confirmed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_package_image_larger_than_its_partition_is_refused_at_the_plan() {
+        let (path, mut agent) = a_block_agent("firmware-too-big", FIRMWARE_DISK_SECTORS);
+        let mut package = crate::firmware::tests::read_package(&a_small_package()).expect("intact");
+        package.images[0].bytes = 0x401 * 512;
+        let error = pollster::block_on(plan_firmware(&mut agent, &package, None))
+            .expect_err("too big for uboot");
+        assert!(error.to_string().contains("'uboot'"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An image entry that names no partition has nowhere to go, and is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_package_entry_for_no_partition_is_refused_at_the_plan() {
+        let (path, mut agent) = a_block_agent("firmware-no-partition", FIRMWARE_DISK_SECTORS);
+        let mut package = crate::firmware::tests::read_package(&a_small_package()).expect("intact");
+        package.images[1].name = "recovery".to_string();
+        let error = pollster::block_on(plan_firmware(&mut agent, &package, None))
+            .expect_err("no recovery partition");
+        assert!(error.to_string().contains("names no partition"), "{error}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A plan that streams images needs the package again at the write, and one
+    /// given none is refused before anything is written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_package_write_with_no_package_is_refused() {
+        let (path, mut agent) = a_block_agent("firmware-no-source", FIRMWARE_DISK_SECTORS);
+        let package = crate::firmware::tests::read_package(&a_small_package()).expect("intact");
+        let plan = pollster::block_on(plan_firmware(&mut agent, &package, None)).expect("plan");
+        let error = pollster::block_on(write_firmware(
+            &mut agent,
+            plan.confirm(),
+            None,
+            &mut |_| {},
+            &Cancel::new(),
+        ))
+        .expect_err("no package");
+        assert!(error.to_string().contains("no package"), "{error}");
+        let disk = std::fs::read(&path).expect("the disk");
+        assert!(disk.iter().all(|&b| b == 0), "nothing was written");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ID block alone lands at sector 64 and leaves the rest of the disk as it
+    /// was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_id_block_alone_lands_at_sector_64() {
+        let (path, mut agent) = a_block_agent("id-block", 256);
+        let loader =
+            crate::codec::rkboot::parse(&crate::firmware::tests::a_loader()).expect("a container");
+        let plan = pollster::block_on(plan_write_id_block(&mut agent, &loader, None))
+            .expect("an ID block plans");
+        assert_eq!(plan.what, FirmwareWrite::IdBlock);
+        assert_eq!(plan.runs.len(), 1);
+        assert_eq!(plan.runs[0].lba, 64);
+        assert!(!plan.needs_package());
+
+        pollster::block_on(write_firmware(
+            &mut agent,
+            plan.confirm(),
+            None,
+            &mut |_| {},
+            &Cancel::new(),
+        ))
+        .expect("written and read back");
+        drop(agent);
+
+        let disk = std::fs::read(&path).expect("the disk");
+        let built = idb::build(&loader).expect("builds");
+        assert_eq!(
+            &disk[64 * 512..64 * 512 + built.bytes.len()],
+            built.bytes.as_slice()
+        );
+        assert!(
+            disk[..64 * 512].iter().all(|&b| b == 0),
+            "nothing before it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The ID block plan asks a rockusb loader for its capability reply. A reply
+    /// without `NEW_IDB`, and a failed query, are both refused, with the reason;
+    /// a reply that sets it passes. The refusal is asked of the plan and is the
+    /// one the write makes.
+    #[test]
+    fn a_rockusb_id_block_needs_a_loader_that_claims_new_idb() {
+        use crate::codec::bot::Direction;
+        use crate::codec::rockusb::Opcode;
+        use crate::testing::{cbw, csw_failed, csw_passed};
+
+        let soc = Soc::parse("rk3576").expect("pinned");
+        let loader =
+            crate::codec::rkboot::parse(&crate::firmware::tests::a_loader()).expect("a container");
+        let plan_with = |reply: [u8; 8], failed: bool| {
+            // The plan's reads take tags 1 to 13, so the capability query is 14.
+            let mut steps = scripted_plan(1);
+            steps.push(cbw(14, 8, Direction::In, Opcode::ReadCapability, 0, 0));
+            steps.push(Step::Reply(reply.to_vec()));
+            steps.push(if failed {
+                csw_failed(14)
+            } else {
+                csw_passed(14)
+            });
+            let mut agent = FlashAgent::Rockusb(RockusbAgent::new(ScriptedTransport::new(steps)));
+            let plan = pollster::block_on(plan_write_id_block(&mut agent, &loader, Some(soc)))
+                .expect("a plan");
+            (agent, plan)
+        };
+
+        let (agent, plan) = plan_with([0, 0x01, 0, 0, 0, 0, 0, 0], false);
+        assert!(firmware_refusal(&agent, &plan).is_none(), "NEW_IDB is set");
+
+        let (agent, plan) = plan_with([0xff, 0x02, 0, 0, 0, 0, 0, 0], false);
+        let refused = firmware_refusal(&agent, &plan).expect("NEW_IDB is clear");
+        assert!(refused.to_string().contains("NEW_IDB"), "{refused}");
+
+        let (agent, plan) = plan_with([0; 8], true);
+        assert!(matches!(plan.capability, LoaderCapability::NotAnswered(_)));
+        let refused = firmware_refusal(&agent, &plan).expect("no answer");
+        assert!(refused.to_string().contains("did not answer"), "{refused}");
+    }
+
+    /// The loader container's own claim is judged as an upload judges it: a
+    /// container built for another SoC is refused before its ID block is written.
+    #[test]
+    fn an_id_block_from_another_socs_container_is_refused() {
+        use crate::codec::bot::Direction;
+        use crate::codec::rockusb::Opcode;
+        use crate::testing::{cbw, csw_passed};
+
+        let soc = Soc::parse("rk3576").expect("pinned");
+        let mut loader =
+            crate::codec::rkboot::parse(&crate::firmware::tests::a_loader()).expect("a container");
+        loader.chip = Some(*b"8853");
+        let mut steps = scripted_plan(1);
+        steps.push(cbw(14, 8, Direction::In, Opcode::ReadCapability, 0, 0));
+        steps.push(Step::Reply(vec![0, 0x01, 0, 0, 0, 0, 0, 0]));
+        steps.push(csw_passed(14));
+        let mut agent = FlashAgent::Rockusb(RockusbAgent::new(ScriptedTransport::new(steps)));
+        let plan = pollster::block_on(plan_write_id_block(&mut agent, &loader, Some(soc)))
+            .expect("a plan");
+        let refused = firmware_refusal(&agent, &plan).expect("the wrong container");
+        assert!(
+            matches!(refused, Error::LoaderBlobMismatch { .. }),
+            "{refused:?}"
+        );
+    }
+
+    /// A container a tool unpacks is refused by its first bytes, and an ID block
+    /// is not.
+    #[test]
+    fn image_refusal_names_the_containers_a_raw_write_refuses() {
+        assert!(image_refusal(b"RKFW").is_some());
+        assert!(image_refusal(b"RKAF").is_some());
+        assert!(image_refusal(b"LDR ").is_some());
+        assert!(image_refusal(b"BOOT").is_some());
+        assert!(
+            image_refusal(b"RKNS").is_none(),
+            "an ID block is written raw"
+        );
+        assert!(image_refusal(&[0u8; 4]).is_none());
+        assert!(
+            image_refusal(b"RK").is_none(),
+            "too short to begin anything"
+        );
+    }
+
+    /// `flash` refuses a firmware package written raw, from its first bytes,
+    /// before a command reaches the device. The empty script after the plan proves
+    /// it: a write, or even the loader re-check, would find nothing scripted.
+    #[test]
+    fn flash_refuses_a_package_written_raw_before_touching_the_device() {
+        let soc = Soc::parse("rk3576").expect("pinned");
+        let bytes = a_small_package();
+        let mut agent =
+            FlashAgent::Rockusb(RockusbAgent::new(ScriptedTransport::new(scripted_plan(1))));
+        let plan = pollster::block_on(plan_write(&mut agent, 0x800, bytes.len() as u64, Some(soc)))
+            .expect("a plan");
+        let error = pollster::block_on(flash(
+            &mut agent,
+            plan.confirm(),
+            &mut SyncReader::new(bytes.as_slice()),
+            &mut |_| {},
+            &Cancel::new(),
+        ))
+        .expect_err("a package is not written raw");
+        assert!(error.to_string().contains("firmware package"), "{error}");
         let FlashAgent::Rockusb(agent) = &agent else {
             unreachable!("the test built a Rockusb agent")
         };

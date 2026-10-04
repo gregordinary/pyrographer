@@ -321,6 +321,31 @@ impl Default for ConsoleForm {
 
 /// Which of a recovery's three files a pick is for.
 ///
+/// What has been picked into the board's firmware section.
+///
+/// Both files are streamed rather than held, because a firmware package is
+/// gigabytes, and a loader can be given as the package that carries it. The package
+/// is read twice: once on the job thread to check it and plan, and again from its
+/// first byte when the write streams its partition images. Nothing can change
+/// between the two, because the plan screen takes the whole window.
+#[derive(Default)]
+pub struct FirmwareForm {
+    /// The firmware package (`update.img`) to write whole.
+    pub package: Option<PickedImage>,
+    /// The loader to write an ID block from: a loader container, or a firmware
+    /// package whose loader is used.
+    pub loader: Option<PickedImage>,
+}
+
+/// Which file of the firmware section a file dialog is filling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareFileKind {
+    /// The firmware package.
+    Package,
+    /// The loader for an ID block alone.
+    Loader,
+}
+
 /// One file dialog serves all three, so the file it is filling is remembered until
 /// it answers. The web build's `choosing_for` has the same shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,6 +555,15 @@ pub struct App {
     /// form use the same "declared, not dumped" shape. The authoring half has its
     /// own reveal too, so this one puts repair and authoring behind a single door.
     pub show_table_tools: bool,
+    /// What has been picked into the firmware section.
+    pub firmware: FirmwareForm,
+    /// Whether the firmware section is drawn open.
+    ///
+    /// It is shut until asked for, as the partition table tools are, and for the
+    /// same reason. Writing a whole firmware package or an ID block is what
+    /// somebody comes to do on purpose, not part of reading or writing a board that
+    /// is fine.
+    pub show_firmware_tools: bool,
     /// Whether the serial recovery form has been revealed.
     ///
     /// The USB flows are discovered: a scan finds a board, and its screen
@@ -559,6 +593,11 @@ pub struct App {
     /// whole, like a recovery file rather than a streamed image, because a layout
     /// is small. It is cross-platform, because the web build offers authoring too.
     picking_layout: Option<Slot<Picked<PickedBlob>>>,
+
+    /// A firmware package or a loader being picked for the firmware section, and
+    /// which of the two the dialog is filling. Both are streamed, like an image.
+    picking_firmware: Option<Slot<Picked<PickedImage>>>,
+    picking_firmware_which: FirmwareFileKind,
 
     /// A maskrom board's loader being picked and its transport opened, before the
     /// bootstrap job starts. `Ok(None)` is a file dialog somebody closed.
@@ -693,6 +732,8 @@ impl App {
             maskrom: MaskromForm::default(),
             tab: Tab::default(),
             show_table_tools: false,
+            firmware: FirmwareForm::default(),
+            show_firmware_tools: false,
             show_recovery: false,
             show_console: false,
             ctx,
@@ -701,6 +742,8 @@ impl App {
             picking_image: None,
             picking_sink: None,
             picking_layout: None,
+            picking_firmware: None,
+            picking_firmware_which: FirmwareFileKind::Package,
             bootstrapping: None,
             picking_maskrom_stage: None,
             picking_maskrom_which: MaskromStageKind::Code471,
@@ -803,6 +846,7 @@ impl App {
         self.picking_image.is_some()
             || self.picking_sink.is_some()
             || self.picking_layout.is_some()
+            || self.picking_firmware.is_some()
             || self.picking_maskrom_stage.is_some()
             // The recovery files and the bootstrap stages, which used to guard
             // only their own slot -- so an image dialog and a recovery-file dialog
@@ -834,6 +878,7 @@ impl App {
         self.collect_image();
         self.collect_sink(now);
         self.collect_layout_file();
+        self.collect_firmware_file();
         self.collect_maskrom_stage();
         self.collect_bootstrap(now);
         self.collect_recovery_file();
@@ -922,6 +967,29 @@ impl App {
 
         match picked {
             Ok(Some(blob)) => self.author.file = Some(blob),
+            Ok(None) => {}
+            Err(error) => self.failed(error),
+        }
+    }
+
+    /// A firmware package or a loader somebody picked for the firmware section.
+    ///
+    /// A dialog somebody closed leaves the file as it was.
+    fn collect_firmware_file(&mut self) {
+        let Some(picked) = self
+            .picking_firmware
+            .as_ref()
+            .and_then(|slot| lock(slot).take())
+        else {
+            return;
+        };
+        self.picking_firmware = None;
+
+        match picked {
+            Ok(Some(file)) => match self.picking_firmware_which {
+                FirmwareFileKind::Package => self.firmware.package = Some(file),
+                FirmwareFileKind::Loader => self.firmware.loader = Some(file),
+            },
             Ok(None) => {}
             Err(error) => self.failed(error),
         }
@@ -1275,6 +1343,89 @@ impl App {
         self.run(task, now);
     }
 
+    /// Ask for a firmware package, or a loader, for the firmware section.
+    ///
+    /// It uses the streamed image picker, because a package is gigabytes. A loader
+    /// given as a package is read only as far as its loader.
+    pub fn pick_firmware_file(&mut self, which: FirmwareFileKind) {
+        if self.is_picking() {
+            return;
+        }
+        let slot: Slot<Picked<PickedImage>> = share(None);
+        self.picking_firmware = Some(slot.clone());
+        self.picking_firmware_which = which;
+
+        let wake = self.wake();
+        platform::spawn_answering(
+            "picking a firmware file",
+            &slot,
+            wake,
+            platform::ask_for_image,
+        );
+    }
+
+    /// Forget a file of the firmware section.
+    pub fn forget_firmware_file(&mut self, which: FirmwareFileKind) {
+        match which {
+            FirmwareFileKind::Package => self.firmware.package = None,
+            FirmwareFileKind::Loader => self.firmware.loader = None,
+        }
+    }
+
+    /// Plan writing the picked firmware package: the dry run.
+    ///
+    /// The package is read and checked whole on the job thread, then planned
+    /// against the board. A missing file is reported like any other failure, and no
+    /// plan screen appears.
+    pub fn plan_firmware(&mut self, now: f64) {
+        let Some(package) = self.firmware.package.as_ref() else {
+            self.failed(Error::InvalidRequest(
+                "choose a firmware package to write first".to_string(),
+            ));
+            return;
+        };
+        let package_bytes = package.bytes;
+        match package.reader() {
+            Ok(reader) => {
+                let soc = self.planned_soc();
+                self.run(
+                    Task::PlanFirmware {
+                        package: reader,
+                        package_bytes,
+                        soc,
+                    },
+                    now,
+                );
+            }
+            Err(error) => self.failed(error),
+        }
+    }
+
+    /// Plan writing the ID block built from the picked loader: the dry run.
+    pub fn plan_id_block(&mut self, now: f64) {
+        let Some(loader) = self.firmware.loader.as_ref() else {
+            self.failed(Error::InvalidRequest(
+                "choose a loader to build the ID block from first".to_string(),
+            ));
+            return;
+        };
+        let loader_bytes = loader.bytes;
+        match loader.reader() {
+            Ok(reader) => {
+                let soc = self.planned_soc();
+                self.run(
+                    Task::PlanIdBlock {
+                        loader: reader,
+                        loader_bytes,
+                        soc,
+                    },
+                    now,
+                );
+            }
+            Err(error) => self.failed(error),
+        }
+    }
+
     /// Whether a maskrom loader is being picked, or its board opened, or uploaded.
     pub fn is_bootstrapping(&self) -> bool {
         self.bootstrapping.is_some() || self.session.bootstrap.is_some()
@@ -1560,6 +1711,31 @@ impl App {
             // alongside the confirmation.
             Confirmed::Table(confirmed) => {
                 self.run(Task::WriteTable { confirmed }, now);
+            }
+
+            // A firmware plan holds its tables and its ID block. Its partition
+            // images stream from the package, which is opened again from its first
+            // byte. An ID block alone needs no file.
+            Confirmed::Firmware(confirmed) => {
+                let package = if confirmed.plan().needs_package() {
+                    let Some(package) = self.firmware.package.as_ref() else {
+                        self.failed(Error::InvalidRequest(
+                            "there is no firmware package to write. Choose one and plan again"
+                                .to_string(),
+                        ));
+                        return;
+                    };
+                    match package.reader() {
+                        Ok(reader) => Some(reader),
+                        Err(error) => {
+                            self.failed(error);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.run(Task::WriteFirmware { confirmed, package }, now);
             }
         }
     }

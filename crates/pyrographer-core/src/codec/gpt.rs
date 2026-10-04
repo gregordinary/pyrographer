@@ -909,6 +909,39 @@ pub struct AuthoredGpt {
     pub disk_guid: Guid,
 }
 
+/// The first and last sectors an authored GPT leaves for partitions, on a part of
+/// `flash_sectors` sectors of `sector_size` bytes.
+///
+/// Sector 0 is the protective MBR and sector 1 the header. The [`GPT_ENTRIES`]-slot
+/// array follows the header, and the first usable sector is after the array. The
+/// backup mirrors that at the end: its header is on the last sector, and its array
+/// is before it. The last usable sector is therefore a whole array plus that header
+/// short of the end. On a 512-byte part, the range is 34 to `flash_sectors - 34`.
+///
+/// [`author`] lays a table out on this range. A caller resolving a partition that grows to
+/// fill the part ends it at the last usable sector.
+///
+/// A part too small to hold a table and its backup is an [`Error::InvalidRequest`].
+pub fn usable_range(flash_sectors: u64, sector_size: usize) -> Result<(u64, u64)> {
+    let bad = Error::InvalidRequest;
+    let array_sectors = (GPT_ENTRIES as usize * ENTRY_LEN).div_ceil(sector_size.max(1)) as u64;
+    let first_usable = HEADER_LBA + 1 + array_sectors;
+    let last_lba = flash_sectors.checked_sub(1).ok_or_else(|| {
+        bad("the device reports no sectors, so there is nowhere to author a GPT".to_string())
+    })?;
+    let last_usable = last_lba
+        .checked_sub(array_sectors)
+        .and_then(|lba| lba.checked_sub(1))
+        .filter(|&last_usable| last_usable >= first_usable)
+        .ok_or_else(|| {
+            bad(format!(
+                "the device has {flash_sectors} sectors, too few to hold a GPT and its backup: the \
+                 header, two entry arrays, and the backup header leave no usable region"
+            ))
+        })?;
+    Ok((first_usable, last_usable))
+}
+
 /// Author a fresh GPT from a resolved partition list: a protective MBR, a primary,
 /// and a backup, with every CRC computed.
 ///
@@ -974,28 +1007,11 @@ pub fn author(
         )));
     }
 
-    // The reserved geometry: sector 0 is the MBR, sector 1 the header, the array
-    // follows the header, and the first usable sector is after the array. The
-    // backup mirrors it at the end -- its header on the last sector, its array
-    // before that -- so the last usable sector is a whole array plus that header
-    // short of the end.
+    let (first_usable, last_usable) = usable_range(flash_sectors, sector_size)?;
     let array_len = slots * ENTRY_LEN;
-    let array_sectors = array_len.div_ceil(sector_size) as u64;
     let array_lba = HEADER_LBA + 1;
-    let first_usable = array_lba + array_sectors;
-    let last_lba = flash_sectors.checked_sub(1).ok_or_else(|| {
-        bad("the device reports no sectors, so there is nowhere to author a GPT".to_string())
-    })?;
-    let last_usable = last_lba
-        .checked_sub(array_sectors)
-        .and_then(|lba| lba.checked_sub(1))
-        .filter(|&last_usable| last_usable >= first_usable)
-        .ok_or_else(|| {
-            bad(format!(
-                "the device has {flash_sectors} sectors, too few to hold a GPT and its backup: the \
-                 header, two entry arrays, and the backup header leave no usable region"
-            ))
-        })?;
+    // `usable_range` has refused a part with no sectors, so this does not wrap.
+    let last_lba = flash_sectors - 1;
 
     // The entry array: the partitions in the first slots, the rest left zero, which
     // is the unused-slot GUID `parse_entries` skips.
@@ -2069,5 +2085,18 @@ mod tests {
         let too_many: Vec<AuthoredPartition> =
             (0..129).map(|_| authored("p", 34, 1, 0x11)).collect();
         assert!(refused(&too_many, 0x1_0000));
+    }
+
+    /// On a 512-byte part the usable range is 34 to 34 short of the end, the
+    /// numbers Rockchip's own tool writes, and a part too small for two tables has
+    /// none.
+    #[test]
+    fn the_usable_range_leaves_room_for_both_copies() {
+        assert_eq!(
+            usable_range(0x10000, 512).expect("fits"),
+            (34, 0x10000 - 34)
+        );
+        assert!(usable_range(60, 512).is_err());
+        assert!(usable_range(0, 512).is_err());
     }
 }

@@ -18,7 +18,7 @@ use pyrographer_core::codec::rkboot::{self, CHUNK_SIZE, CodeBlob, LoaderImage};
 use pyrographer_core::codec::rockusb::{self, Opcode, ResetMode};
 use pyrographer_core::codec::{splhdr, xmodem};
 use pyrographer_core::discovery::{DeviceInfo, Mode, Vendor};
-use pyrographer_core::image::SyncWriter;
+use pyrographer_core::image::{SyncReader, SyncWriter};
 use pyrographer_core::partition::TableFormat;
 use pyrographer_core::recovery::RecoveryTarget;
 use pyrographer_core::testing::{
@@ -31,7 +31,7 @@ use pyrographer_core::uboot::{Gadget, GadgetDevice};
 use pyrographer_core::verbs::{TableAction, Touches, WritePlan};
 
 use super::*;
-use crate::platform::{BoxedWriter, PickedBlob, PickedImage};
+use crate::platform::{BoxedReader, BoxedWriter, PickedBlob, PickedImage};
 
 /// A board on the bus, as a scan would report one.
 fn a_device(bus: &str, address: u8) -> DeviceInfo {
@@ -81,6 +81,12 @@ fn an_image(name: &str, bytes: u64) -> PickedImage {
         bytes,
         path: name.into(),
     }
+}
+
+/// An image's bytes as a job reads them, the way a picked file's reader hands
+/// them over.
+fn a_reader(bytes: Vec<u8>) -> BoxedReader {
+    Box::new(SyncReader::new(std::io::Cursor::new(bytes)))
 }
 
 /// A dump's sink, and a way to look inside it afterwards.
@@ -418,6 +424,7 @@ fn planning_a_write_asks_the_board_and_leaves_a_plan_waiting_to_be_agreed_to() {
         Task::PlanWrite {
             aim: Aim::Partition("uboot".to_string()),
             image_bytes: 4096,
+            image: a_reader(vec![0x5a; 4096]),
             soc: None,
         },
     );
@@ -464,6 +471,7 @@ fn a_plan_that_named_no_soc_cannot_be_confirmed_at_all() {
         Task::PlanWrite {
             aim: Aim::Lba(0),
             image_bytes: 4096,
+            image: a_reader(vec![0x5a; 4096]),
             soc: None,
         },
     );
@@ -512,6 +520,7 @@ fn a_plan_whose_named_soc_matches_the_loader_can_be_confirmed() {
         Task::PlanWrite {
             aim: Aim::Lba(0),
             image_bytes: 4096,
+            image: a_reader(vec![0x5a; 4096]),
             soc: Some(soc),
         },
     );
@@ -1274,6 +1283,7 @@ fn a_maskrom_bootstrap_uploads_the_loader_and_forgets_the_board() {
             data: data_472.clone(),
             delay_ms: 0,
         }],
+        flash_stages: Vec::new(),
         rc4_disabled: true,
     };
 
@@ -1355,6 +1365,7 @@ fn a_bootstrap_forgets_the_board_it_uploaded_to_and_leaves_any_other_alone() {
             }],
             code_472: Vec::new(),
             chip: None,
+            flash_stages: Vec::new(),
             rc4_disabled: true,
         };
         let steps = expect_control(0x0471, &rkboot::download_payload(&data_471));
@@ -1561,6 +1572,7 @@ fn a_bare_loader() -> LoaderImage {
             delay_ms: 0,
         }],
         code_472: vec![],
+        flash_stages: Vec::new(),
         rc4_disabled: true,
     }
 }
@@ -2173,6 +2185,7 @@ fn a_disks_plan_is_not_refused_for_naming_no_soc() {
         Task::PlanWrite {
             aim: Aim::Lba(0),
             image_bytes: 4096,
+            image: a_reader(vec![0x5a; 4096]),
             soc: None,
         },
     );
@@ -2217,6 +2230,7 @@ fn a_disk_write_lands_and_reads_back() {
         Task::PlanWrite {
             aim: Aim::Lba(0),
             image_bytes: bytes.len() as u64,
+            image: a_reader(bytes.clone()),
             soc: None,
         },
     );
@@ -2303,4 +2317,205 @@ fn a_disk_listing_that_failed_says_so_rather_than_showing_nothing() {
         disks.problem
     );
     assert!(disks.listed.is_empty());
+}
+
+/// The capability query a firmware plan asks after the chip version, answered with
+/// `reply`: `NEW_IDB` is byte 1, bit 0.
+fn scripted_capability(tag: u32, reply: [u8; 8]) -> Vec<Step> {
+    vec![
+        pyrographer_core::testing::cbw(tag, 8, Direction::In, Opcode::ReadCapability, 0, 0),
+        Step::Reply(reply.to_vec()),
+        pyrographer_core::testing::csw_passed(tag),
+    ]
+}
+
+/// Planning a firmware package reads the whole package on the job thread, plans it
+/// against the board, and leaves one plan waiting: every partition image, both GPT
+/// copies, and the ID block, under one gate. Confirming it mints a
+/// `Confirmed::Firmware`.
+#[test]
+fn planning_a_firmware_package_leaves_one_plan_waiting() {
+    let mut steps = scripted_info(1);
+    steps.extend(scripted_chip_version(3));
+    steps.extend(scripted_capability(4, [0, 0x01, 0, 0, 0, 0, 0, 0]));
+    let mut session = a_session(steps);
+    let package = pyrographer_core::testing::firmware_package_for_a_board();
+    let soc = Soc::parse("rk3576").expect("pinned");
+
+    run(
+        &mut session,
+        Task::PlanFirmware {
+            package_bytes: package.len() as u64,
+            package: a_reader(package),
+            soc: Some(soc),
+        },
+    );
+
+    let pending = session.pending.as_mut().expect("a plan is waiting");
+    assert!(pending.refused.is_none(), "{:?}", pending.refused);
+    let Plan::Firmware(plan) = &pending.plan else {
+        panic!("a firmware write was planned");
+    };
+    let runs: Vec<u64> = plan.runs.iter().map(|run| run.lba).collect();
+    assert_eq!(
+        runs,
+        [0x4000, 0x6000, 0, FLASH_SECTORS - 33, 64],
+        "the images, both GPT copies, and the ID block last"
+    );
+
+    if let Confirmation::Typed { expected, typed } = &mut pending.confirmation {
+        *typed = expected.clone();
+    }
+    assert!(matches!(session.confirm(), Some(Confirmed::Firmware(_))));
+}
+
+/// A loader that does not claim `NEW_IDB` gets its plan screen, refused, and no
+/// confirmation can unlock it.
+#[test]
+fn a_firmware_plan_through_a_loader_without_new_idb_is_refused_on_its_screen() {
+    let mut steps = scripted_info(1);
+    steps.extend(scripted_chip_version(3));
+    steps.extend(scripted_capability(4, [0; 8]));
+    let mut session = a_session(steps);
+    let package = pyrographer_core::testing::firmware_package_for_a_board();
+
+    run(
+        &mut session,
+        Task::PlanFirmware {
+            package_bytes: package.len() as u64,
+            package: a_reader(package),
+            soc: Some(Soc::parse("rk3576").expect("pinned")),
+        },
+    );
+
+    let pending = session.pending.as_ref().expect("the plan is still shown");
+    let refused = pending.refused.as_deref().expect("and refused");
+    assert!(refused.contains("NEW_IDB"), "{refused}");
+    assert!(!pending.can_confirm());
+}
+
+/// A firmware package picked for a plain write is refused by its first bytes,
+/// before the board is asked anything. The empty script proves it: one command to
+/// the board would find nothing scripted.
+#[test]
+fn a_package_picked_for_a_plain_write_is_refused_before_the_board_is_asked() {
+    let mut session = a_session(Vec::new());
+    let package = pyrographer_core::testing::firmware_package_for_a_board();
+
+    run(
+        &mut session,
+        Task::PlanWrite {
+            aim: Aim::Lba(0),
+            image_bytes: package.len() as u64,
+            image: a_reader(package),
+            soc: None,
+        },
+    );
+
+    assert!(session.pending.is_none(), "no plan for a container");
+    let Some(Err(error)) = &session.last else {
+        panic!("the plan failed");
+    };
+    assert!(error.to_string().contains("firmware package"), "{error}");
+}
+
+/// A whole package written to a disk through the window lands and reads back: the
+/// ID block at sector 64 checks against its own header, and each image sits in its
+/// partition.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_firmware_package_lands_on_a_disk_through_the_window() {
+    let (path, mut session) = a_disk_session("firmware", 0x2000);
+    let package = pyrographer_core::testing::firmware_package_for_a_small_disk();
+
+    run(
+        &mut session,
+        Task::PlanFirmware {
+            package_bytes: package.len() as u64,
+            package: a_reader(package.clone()),
+            soc: None,
+        },
+    );
+    let pending = session.pending.as_mut().expect("a plan is waiting");
+    if let Confirmation::Typed { expected, typed } = &mut pending.confirmation {
+        *typed = expected.clone();
+    }
+    let Some(Confirmed::Firmware(confirmed)) = session.confirm() else {
+        panic!("the plan mints a firmware write");
+    };
+
+    run(
+        &mut session,
+        Task::WriteFirmware {
+            confirmed,
+            package: Some(a_reader(package)),
+        },
+    );
+    assert!(
+        matches!(
+            session.last,
+            Some(Ok(Report::FirmwareWritten {
+                id_block_only: false,
+                runs: 5,
+                ..
+            }))
+        ),
+        "the write landed"
+    );
+
+    let disk = std::fs::read(&path).expect("the disk");
+    pyrographer_core::codec::idb::check(&disk[64 * 512..80 * 512])
+        .expect("the ID block checks against its own header");
+    assert!(
+        disk[0x800 * 512..0x800 * 512 + 5000]
+            .iter()
+            .all(|&b| b == 0x55)
+    );
+    assert!(
+        disk[0xc00 * 512..0xc00 * 512 + 3000]
+            .iter()
+            .all(|&b| b == 0x66)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An ID block alone needs no package at the write, and lands at sector 64.
+#[test]
+#[cfg(target_os = "linux")]
+fn an_id_block_lands_on_a_disk_through_the_window() {
+    let (path, mut session) = a_disk_session("id-block", 256);
+    let loader = pyrographer_core::testing::loader_container();
+
+    run(
+        &mut session,
+        Task::PlanIdBlock {
+            loader_bytes: loader.len() as u64,
+            loader: a_reader(loader),
+            soc: None,
+        },
+    );
+    let pending = session.pending.as_mut().expect("a plan is waiting");
+    if let Confirmation::Typed { expected, typed } = &mut pending.confirmation {
+        *typed = expected.clone();
+    }
+    let Some(Confirmed::Firmware(confirmed)) = session.confirm() else {
+        panic!("the plan mints a firmware write");
+    };
+    run(
+        &mut session,
+        Task::WriteFirmware {
+            confirmed,
+            package: None,
+        },
+    );
+    assert!(matches!(
+        session.last,
+        Some(Ok(Report::FirmwareWritten {
+            id_block_only: true,
+            ..
+        }))
+    ));
+    let disk = std::fs::read(&path).expect("the disk");
+    pyrographer_core::codec::idb::check(&disk[64 * 512..80 * 512]).expect("an ID block at 64");
+    let _ = std::fs::remove_file(&path);
 }

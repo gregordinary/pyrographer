@@ -106,23 +106,61 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 ///
 /// The stored value is little-endian, like every other integer in the parameter
 /// block's header. [`rkparam`](super::rkparam) handles the byte order.
+///
+/// A firmware package's archive carries the same checksum over gigabytes, as
+/// [`rkfw`](super::rkfw) describes. [`crc32_rockchip_update`] continues one across
+/// the windows such a file is read in.
 pub fn crc32_rockchip(bytes: &[u8]) -> u32 {
-    let mut crc = 0u32;
+    crc32_rockchip_update(0, bytes)
+}
 
+/// Continue Rockchip's CRC-32 from `crc` over `bytes`.
+///
+/// The checksum has no final step, so the running value after one window is the
+/// starting value for the next. `crc32_rockchip_update(crc32_rockchip(a), b)` is
+/// `crc32_rockchip` of `a` followed by `b`, and a test asserts that. A caller
+/// starts from zero.
+///
+/// It is table-driven, unlike [`crc32`]. A firmware package's archive is read from
+/// a local file with no bus in between, so this loop is the slowest part of reading
+/// one. The table is computed at compile time from the polynomial, so it
+/// holds no constant that was written by hand. A test checks it against the bitwise
+/// definition.
+pub fn crc32_rockchip_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for &byte in bytes {
-        // Unreflected: the byte enters at the top of the register, not the
-        // bottom, and the loop below shifts left rather than right.
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
-            let carry = crc & 0x8000_0000;
-            crc <<= 1;
-            if carry != 0 {
-                crc ^= POLYNOMIAL_ROCKCHIP;
-            }
-        }
+        // Unreflected: the byte enters at the top of the register, so the index
+        // is the top byte, and the register shifts left.
+        let index = ((crc >> 24) ^ u32::from(byte)) as usize;
+        crc = (crc << 8) ^ ROCKCHIP_TABLE[index];
     }
 
     crc
+}
+
+/// The 256 remainders [`crc32_rockchip_update`] looks up, one for each value of the
+/// register's top byte.
+const ROCKCHIP_TABLE: [u32; 256] = rockchip_table();
+
+/// Compute [`ROCKCHIP_TABLE`]: each byte value shifted through eight steps of the
+/// unreflected, MSB-first division by [`POLYNOMIAL_ROCKCHIP`].
+const fn rockchip_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = (index as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ POLYNOMIAL_ROCKCHIP
+            } else {
+                crc << 1
+            };
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
 }
 
 /// CRC-16/CCITT-FALSE (`0xFFFF`-seeded) over `bytes`: the trailer the Rockchip
@@ -219,6 +257,49 @@ mod tests {
     fn the_rockchip_crc_matches_what_its_reference_tools_compute() {
         assert_eq!(crc32_rockchip(b"FIRMWARE_VER: 6.0.0\n"), 0x67f0_ca39);
         assert_eq!(crc32_rockchip(b""), 0x0000_0000, "no init, no final xor");
+    }
+
+    /// The table-driven loop against the bitwise definition, over every single byte
+    /// value and a longer run, so a wrong table entry cannot hide.
+    #[test]
+    fn the_rockchip_table_agrees_with_the_bitwise_definition() {
+        fn bitwise(bytes: &[u8]) -> u32 {
+            let mut crc = 0u32;
+            for &byte in bytes {
+                crc ^= u32::from(byte) << 24;
+                for _ in 0..8 {
+                    let carry = crc & 0x8000_0000;
+                    crc <<= 1;
+                    if carry != 0 {
+                        crc ^= POLYNOMIAL_ROCKCHIP;
+                    }
+                }
+            }
+            crc
+        }
+
+        for byte in 0..=255u8 {
+            assert_eq!(
+                crc32_rockchip(&[byte]),
+                bitwise(&[byte]),
+                "byte {byte:#04x}"
+            );
+        }
+        let run: Vec<u8> = (0..4096u32).map(|i| (i * 7 + i / 3) as u8).collect();
+        assert_eq!(crc32_rockchip(&run), bitwise(&run));
+    }
+
+    /// A checksum continued across a split is the checksum of the whole, wherever
+    /// the split falls. That is what lets a gigabyte archive be checked a window at
+    /// a time.
+    #[test]
+    fn the_rockchip_crc_continues_across_any_split() {
+        let text = b"FIRMWARE_VER: 6.0.0\nMACHINE_MODEL: rk3576\n";
+        let whole = crc32_rockchip(text);
+        for split in 0..=text.len() {
+            let (a, b) = text.split_at(split);
+            assert_eq!(crc32_rockchip_update(crc32_rockchip(a), b), whole);
+        }
     }
 
     /// The test that keeps the two CRC-32s apart.

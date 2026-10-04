@@ -14,10 +14,13 @@
 //! carry an `rc4_disabled` flag, and the RK3576 loader sets it. The BootROM takes
 //! the bytes as sent.
 //!
-//! The per-512-byte re-key belongs to building the on-flash *ID block*, the
-//! 512-byte block that begins `55 AA F0 0F`. pyrographer does not build an ID
-//! block. This module keeps the cipher as a pinned protocol fact, with the
-//! known-plaintext vector that identifies the key. **\[COMMUNITY\]**
+//! The per-512-byte re-key belongs to the on-flash *ID block*. A loader container
+//! stores its flash stages scrambled this way, block by block, and
+//! [`idb`](super::idb) unscrambles them before laying out an ID block. The key is
+//! measured, not only reported. Unscrambling the RK3576 container's DRAM-init stage
+//! with it yields, byte for byte, the 471 blob that BootROM accepts over USB.
+//! The legacy ID block's first sector, which begins `55 AA F0 0F`, gives a second
+//! known-plaintext vector. **\[COMMUNITY\]**
 
 /// The 16-byte RC4 key that Rockchip's tooling scrambles the on-flash ID block with.
 ///
@@ -25,9 +28,9 @@
 /// belongs to the ID-block path. pyrographer's loader upload sends verbatim bytes
 /// and does not use it.
 ///
-/// A known-plaintext block identifies the key. The 512-byte ID block begins
-/// `55 AA F0 0F`, which this key encrypts to `3B 8C DC FC`, and a test asserts that
-/// result. The same sixteen bytes appear in rkdeveloptool, rkflashtool and xrock,
+/// A known-plaintext block identifies the key. The legacy ID block's first sector
+/// begins `55 AA F0 0F`, which this key encrypts to `3B 8C DC FC`, and a test
+/// asserts that result. The same sixteen bytes appear in rkdeveloptool, rkflashtool and xrock,
 /// and in the BootROM. **\[COMMUNITY\]**
 pub const MASKROM_RC4_KEY: [u8; 16] = [
     0x7c, 0x4e, 0x03, 0x04, 0x55, 0x05, 0x09, 0x07, 0x2d, 0x2c, 0x7b, 0x38, 0x17, 0x0d, 0x17, 0x11,

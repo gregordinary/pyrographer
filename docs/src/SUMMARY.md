@@ -22,6 +22,7 @@
   - [Asking a loader](reference/cli/loader.md)
   - [Partition tables](reference/cli/partition-tables.md)
   - [Reading and writing flash](reference/cli/flash.md)
+  - [Firmware packages and the ID block](reference/cli/firmware.md)
   - [Block devices](reference/cli/block-devices.md)
   - [Serial lines](reference/cli/serial.md)
 - [The window](reference/gui.md)

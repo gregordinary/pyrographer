@@ -35,6 +35,8 @@ weaker claim carries one of these tags:
 | `reset` | Measured in the default mode. The other three modes are `[COMMUNITY]`. |
 | `flash`, `verify`, `clone` | `[UNVERIFIED]`. No write to a board has run. |
 | `repair-table`, `repair-param`, `author-gpt`, `author-param` | `[UNVERIFIED]` |
+| `write-idb`, `flash-firmware` | `[UNVERIFIED]`. The ID block layout is measured from rkbin's loader. |
+| `firmware-info` | `[UNVERIFIED]`. No package from a vendor build has been read. |
 
 The wrong-loader gate is armed for `rk3576` alone, so a write to any other Rockchip SoC is
 refused. Erasing is refused. The erase opcode is published by Rockchip `[DOC]`, but no board has

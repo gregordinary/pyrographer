@@ -30,6 +30,8 @@ use pyrographer_core::codec::rkboot::LoaderImage;
 use pyrographer_core::codec::rockusb::{Capability, ResetMode, StorageMedium};
 use pyrographer_core::console::{self, ConsoleSink, Watched};
 use pyrographer_core::fill::FillReport;
+use pyrographer_core::firmware;
+use pyrographer_core::image::ImageReader;
 use pyrographer_core::layout::Layout;
 use pyrographer_core::partition::{PartitionTable, TableFormat};
 use pyrographer_core::progress::{Cancel, Progress};
@@ -38,8 +40,9 @@ use pyrographer_core::soc::Soc;
 use pyrographer_core::transport::{Serial, Transport};
 use pyrographer_core::uboot::{BootPlan, ConfirmedBoot, Gadget, GadgetDevice, UBoot};
 use pyrographer_core::verbs::{
-    self, ClonePlan, ConfirmedClone, ConfirmedSegmentedWrite, ConfirmedWrite, ParamAuthorSource,
-    ParamMedium, SegmentedPlan, TableAction, WritePlan,
+    self, ClonePlan, ConfirmedClone, ConfirmedFirmwareWrite, ConfirmedSegmentedWrite,
+    ConfirmedWrite, FirmwarePlan, FirmwareWrite, ParamAuthorSource, ParamMedium, SegmentedPlan,
+    TableAction, WritePlan,
 };
 
 use crate::platform::{BoxedReader, BoxedWriter, Handle, Shared, Wake, lock, share};
@@ -145,6 +148,14 @@ pub enum Task {
         aim: Aim,
         /// How many bytes it would put there.
         image_bytes: u64,
+        /// The image, read only as far as its first bytes.
+        ///
+        /// A firmware package or a loader container written raw does not boot, and
+        /// [`verbs::image_refusal`] judges an image by its first bytes. The plan
+        /// asks it here, before the board is asked anything, so a person is not
+        /// shown a plan for a write that will be refused. The write opens the image
+        /// again from its first byte.
+        image: BoxedReader,
         /// The SoC the person says this board is, for the wrong-loader gate.
         soc: Option<Soc>,
     },
@@ -212,6 +223,37 @@ pub enum Task {
         /// The plan a person agreed to.
         confirmed: ConfirmedSegmentedWrite,
     },
+    /// The dry run for writing a firmware package: read it and check it, then
+    /// plan every partition image, the GPT and the ID block.
+    ///
+    /// The package is read once, front to back, on the job thread. Its checksum
+    /// covers gigabytes, and the window keeps drawing while it is checked.
+    PlanFirmware {
+        /// The package, from its first byte.
+        package: BoxedReader,
+        /// How long it is.
+        package_bytes: u64,
+        /// The SoC the person says this board is, for the wrong-loader gate.
+        soc: Option<Soc>,
+    },
+    /// The dry run for writing a loader's ID block alone.
+    PlanIdBlock {
+        /// The loader file: a loader container, or a firmware package whose loader
+        /// is used.
+        loader: BoxedReader,
+        /// How long the file is.
+        loader_bytes: u64,
+        /// The SoC the person says this board is, for the wrong-loader gate.
+        soc: Option<Soc>,
+    },
+    /// Write a firmware plan a person agreed to, and read every window back.
+    WriteFirmware {
+        /// The plan a person agreed to.
+        confirmed: ConfirmedFirmwareWrite,
+        /// The package again, from its first byte, for a plan that streams its
+        /// partition images from it. `None` for an ID block alone.
+        package: Option<BoxedReader>,
+    },
 }
 
 impl Task {
@@ -231,10 +273,13 @@ impl Task {
             | Task::PlanRepairTable { .. }
             | Task::PlanRepairParam { .. }
             | Task::PlanAuthorParam { .. }
-            | Task::PlanAuthorGpt { .. } => "Planning",
+            | Task::PlanAuthorGpt { .. }
+            | Task::PlanIdBlock { .. } => "Planning",
+            Task::PlanFirmware { .. } => "Checking the firmware package",
             Task::Write { .. } => "Writing",
             Task::Clone { .. } => "Cloning",
             Task::WriteTable { .. } => "Writing the table",
+            Task::WriteFirmware { .. } => "Writing the firmware",
         }
     }
 
@@ -249,6 +294,7 @@ impl Task {
             Task::Write { confirmed, .. } => Some(confirmed.plan().read_back),
             Task::Clone { confirmed } => Some(confirmed.plan().destination.read_back),
             Task::WriteTable { confirmed } => Some(confirmed.plan().read_back),
+            Task::WriteFirmware { confirmed, .. } => Some(confirmed.plan().read_back),
             _ => None,
         }
     }
@@ -372,6 +418,18 @@ pub enum Report {
         /// Whether a fresh table was authored (`true`) or damaged copies of an
         /// existing one repaired (`false`).
         authored: bool,
+    },
+    /// The dry run's answer for a firmware package or an ID block: every run the
+    /// write lays down. This is the screen a person reads before they agree.
+    PlannedFirmware(FirmwarePlan),
+    /// A firmware write landed, and every window of it was read back.
+    FirmwareWritten {
+        /// Whether it was an ID block alone (`true`) or a whole package (`false`).
+        id_block_only: bool,
+        /// How many runs it laid down.
+        runs: usize,
+        /// How many bytes, across every run.
+        bytes: u64,
     },
 }
 
@@ -857,15 +915,28 @@ async fn execute<T: Transport>(
         Task::PlanWrite {
             aim,
             image_bytes,
+            mut image,
             soc,
-        } => match aim {
-            Aim::Lba(lba) => verbs::plan_write(target, lba, image_bytes, soc)
-                .await
-                .map(Report::Planned),
-            Aim::Partition(name) => verbs::plan_write_partition(target, &name, image_bytes, soc)
-                .await
-                .map(Report::Planned),
-        },
+        } => {
+            // The image's first bytes, judged by the function `flash` enforces, so a
+            // container is refused before the board is asked anything.
+            let head_len = image_bytes.min(verbs::CONTAINER_MAGIC_LEN as u64) as usize;
+            let mut head = [0u8; verbs::CONTAINER_MAGIC_LEN];
+            image.read_exact(&mut head[..head_len]).await?;
+            if let Some(refusal) = verbs::image_refusal(&head[..head_len]) {
+                return Err(refusal);
+            }
+            match aim {
+                Aim::Lba(lba) => verbs::plan_write(target, lba, image_bytes, soc)
+                    .await
+                    .map(Report::Planned),
+                Aim::Partition(name) => {
+                    verbs::plan_write_partition(target, &name, image_bytes, soc)
+                        .await
+                        .map(Report::Planned)
+                }
+            }
+        }
 
         Task::Write {
             confirmed,
@@ -952,6 +1023,48 @@ async fn execute<T: Transport>(
             let authored = matches!(confirmed.plan().action, TableAction::Author);
             verbs::write_table(target, confirmed, progress, cancel).await?;
             Ok(Report::TableWritten { format, authored })
+        }
+
+        Task::PlanFirmware {
+            mut package,
+            package_bytes,
+            soc,
+        } => {
+            let package = firmware::read(&mut *package, package_bytes, progress, cancel).await?;
+            verbs::plan_firmware(target, &package, soc)
+                .await
+                .map(Report::PlannedFirmware)
+        }
+
+        Task::PlanIdBlock {
+            mut loader,
+            loader_bytes,
+            soc,
+        } => {
+            let found = firmware::read_loader(&mut *loader, loader_bytes).await?;
+            verbs::plan_write_id_block(target, &found.loader, soc)
+                .await
+                .map(Report::PlannedFirmware)
+        }
+
+        Task::WriteFirmware { confirmed, package } => {
+            // Read off what the plan writes before it is consumed, for the report.
+            let id_block_only = matches!(confirmed.plan().what, FirmwareWrite::IdBlock);
+            let runs = confirmed.plan().runs.len();
+            let bytes = confirmed.plan().total_bytes();
+            match package {
+                Some(mut package) => {
+                    let package: &mut dyn ImageReader = &mut *package;
+                    verbs::write_firmware(target, confirmed, Some(package), progress, cancel)
+                        .await?;
+                }
+                None => verbs::write_firmware(target, confirmed, None, progress, cancel).await?,
+            }
+            Ok(Report::FirmwareWritten {
+                id_block_only,
+                runs,
+                bytes,
+            })
         }
     }
 }

@@ -251,38 +251,7 @@ pub fn block_len(bytes: &[u8]) -> Result<usize> {
 /// them, cannot. The checksum establishes that the parameter is at that sector, so
 /// the sector is a reliable basis for the fixup.
 pub fn parse(block: &[u8], base_lba: u64, flash_sectors: u64) -> Result<Param> {
-    let len = block_len(block)?;
-    if block.len() < len {
-        return Err(corrupt(format!(
-            "the block declares {len} bytes and only {} were read",
-            block.len()
-        )));
-    }
-
-    let text = &block[HEADER_LEN..len - CRC_LEN];
-    let stored = u32::from_le_bytes([
-        block[len - 4],
-        block[len - 3],
-        block[len - 2],
-        block[len - 1],
-    ]);
-
-    // Rockchip's CRC, not the standard one, and over the text alone. It is what
-    // makes the block a finding rather than a coincidence, so it is checked
-    // before a byte of the text is believed.
-    let computed = crc32_rockchip(text);
-    if computed != stored {
-        return Err(corrupt(format!(
-            "the text's CRC is {computed:#010x}, and the block says {stored:#010x}"
-        )));
-    }
-
-    // Lossy, deliberately. The CRC has already said these are the bytes the tool
-    // wrote, so a byte that is not UTF-8 is a byte in some vendor's model name
-    // rather than damage -- and refusing a board its partition table over a
-    // character in a field pyrographer does not read would be a refusal that
-    // protects nobody.
-    let text = String::from_utf8_lossy(text);
+    let text = text(block)?;
 
     let cmdline = text
         .lines()
@@ -301,6 +270,50 @@ pub fn parse(block: &[u8], base_lba: u64, flash_sectors: u64) -> Result<Param> {
     })
 }
 
+/// The text of a parameter block, once its CRC holds: the `KEY: value` lines.
+///
+/// `block` is at least [`block_len`] bytes from the sector the magic is in. The
+/// checksum is checked before a byte of the text is believed, because it is what
+/// makes the block a finding rather than a coincidence. [`parse`] reads the
+/// partition list from this text. A firmware package carries its parameter as one
+/// of these blocks, and its reader takes the whole text, `TYPE` and `uuid:` lines
+/// included.
+///
+/// A block that fails its CRC, or is shorter than it declares, is an
+/// [`Error::CorruptTable`].
+pub fn text(block: &[u8]) -> Result<String> {
+    let len = block_len(block)?;
+    if block.len() < len {
+        return Err(corrupt(format!(
+            "the block declares {len} bytes and only {} were read",
+            block.len()
+        )));
+    }
+
+    let text = &block[HEADER_LEN..len - CRC_LEN];
+    let stored = u32::from_le_bytes([
+        block[len - 4],
+        block[len - 3],
+        block[len - 2],
+        block[len - 1],
+    ]);
+
+    // Rockchip's CRC, not the standard one, and over the text alone.
+    let computed = crc32_rockchip(text);
+    if computed != stored {
+        return Err(corrupt(format!(
+            "the text's CRC is {computed:#010x}, and the block says {stored:#010x}"
+        )));
+    }
+
+    // Lossy, deliberately. The CRC has already said these are the bytes the tool
+    // wrote, so a byte that is not UTF-8 is a byte in some vendor's model name
+    // rather than damage -- and refusing a board its partition table over a
+    // character in a field pyrographer does not read would be a refusal that
+    // protects nobody.
+    Ok(String::from_utf8_lossy(text).into_owned())
+}
+
 /// Parse an `mtdparts` value into partitions, with offsets counted from `base_lba`.
 ///
 /// The value is the `rk29xxnand:<list>` that follows `mtdparts=` on the command
@@ -310,6 +323,23 @@ pub fn parse(block: &[u8], base_lba: u64, flash_sectors: u64) -> Result<Param> {
 /// documents, and `flash_sectors` is the size against which a partition marked to
 /// grow is resolved.
 pub fn parse_mtdparts(mtdparts: &str, base_lba: u64, flash_sectors: u64) -> Result<Vec<Partition>> {
+    parse_mtdparts_growing_to(mtdparts, base_lba, flash_sectors, flash_sectors)
+}
+
+/// [`parse_mtdparts`], with a partition marked to grow ending at `grow_end` rather
+/// than at the end of the part.
+///
+/// A GPT keeps its backup in the last sectors of the part. The partition an
+/// `mtdparts` line marks to grow therefore ends at the GPT's last usable sector,
+/// not at the last sector. A GPT authored from a firmware package's parameter passes that
+/// sector's successor here. `flash_sectors` still bounds where a partition can
+/// begin, and every explicit size is kept as written, for the GPT author to check.
+pub fn parse_mtdparts_growing_to(
+    mtdparts: &str,
+    base_lba: u64,
+    flash_sectors: u64,
+    grow_end: u64,
+) -> Result<Vec<Partition>> {
     // The list is introduced by a storage identifier, which is the literal
     // `rk29xxnand` on every Rockchip part ever made -- including the ones that
     // are not NAND, and including the ones that are not RK29xx. It carries no
@@ -323,7 +353,7 @@ pub fn parse_mtdparts(mtdparts: &str, base_lba: u64, flash_sectors: u64) -> Resu
     })?;
 
     list.split(',')
-        .map(|spec| parse_spec(spec, base_lba, flash_sectors))
+        .map(|spec| parse_spec(spec, base_lba, flash_sectors, grow_end))
         .collect()
 }
 
@@ -332,7 +362,7 @@ pub fn parse_mtdparts(mtdparts: &str, base_lba: u64, flash_sectors: u64) -> Resu
 /// **The size comes first and the offset second**, the reverse of the order most
 /// readers expect. Both count 512-byte sectors, not bytes. A `-` for the size means
 /// the partition takes whatever is left of the part. **\[DOC\]**
-fn parse_spec(spec: &str, base_lba: u64, flash_sectors: u64) -> Result<Partition> {
+fn parse_spec(spec: &str, base_lba: u64, flash_sectors: u64, grow_end: u64) -> Result<Partition> {
     let malformed = || {
         corrupt(format!(
             "'{spec}' is not a partition: an mtdparts entry is <size>@<offset>(<name>), the size \
@@ -368,10 +398,23 @@ fn parse_spec(spec: &str, base_lba: u64, flash_sectors: u64) -> Result<Partition
         )));
     }
 
+    // A partition that grows takes the rest of the part, up to `grow_end`. One
+    // that begins at or past that end has nothing to grow into.
+    let grows = || {
+        grow_end
+            .checked_sub(first_lba)
+            .filter(|&sectors| sectors > 0)
+            .ok_or_else(|| {
+                corrupt(format!(
+                    "'{name}' grows to fill the part from sector {first_lba}, and the part ends \
+                     at sector {grow_end}"
+                ))
+            })
+    };
     let sectors = match size {
-        "-" => flash_sectors - first_lba,
+        "-" => grows()?,
         _ => match hex_sectors(size, spec)? {
-            GROW => flash_sectors - first_lba,
+            GROW => grows()?,
             n => n,
         },
     };
@@ -948,5 +991,38 @@ mod tests {
             assert_eq!(location.lba, index as u64 * 0x400);
             assert!(location.lba < EMMC_BASE_LBA);
         }
+    }
+
+    /// The text comes back whole, every key in it, once the CRC holds, and a block
+    /// whose CRC fails yields no text at all.
+    #[test]
+    fn text_returns_every_line_once_the_crc_holds() {
+        let source = "TYPE: GPT\nCMDLINE: mtdparts=rk29xxnand:0x2000@0x4000(uboot)\nuuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9\n";
+        let block = frame(source).expect("frames");
+        assert_eq!(text(&block).expect("intact"), source);
+
+        let mut damaged = block.clone();
+        damaged[HEADER_LEN] ^= 1;
+        assert!(matches!(text(&damaged), Err(Error::CorruptTable { .. })));
+    }
+
+    /// A growing partition ends where the caller says, and an explicit size is
+    /// kept as written. A GPT's backup holds the last sectors, so a GPT passes its
+    /// last usable sector's successor here.
+    #[test]
+    fn a_growing_partition_ends_where_it_is_told() {
+        let parts = parse_mtdparts_growing_to(
+            "rk29xxnand:0x2000@0x4000(uboot),-@0x6000(userdata:grow)",
+            0,
+            0x10000,
+            0x10000 - 33,
+        )
+        .expect("parses");
+        assert_eq!(parts[0].sectors, 0x2000, "an explicit size is kept");
+        assert_eq!(parts[1].name, "userdata");
+        assert_eq!(parts[1].first_lba + parts[1].sectors, 0x10000 - 33);
+
+        let past = parse_mtdparts_growing_to("rk29xxnand:-@0x9000(userdata)", 0, 0x10000, 0x8000);
+        assert!(matches!(past, Err(Error::CorruptTable { .. })), "{past:?}");
     }
 }

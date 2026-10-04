@@ -347,6 +347,35 @@ no medium.
 other write. The plan names each copy it writes and the partitions the new table holds. Every
 window is read back as it is written.
 
+## Firmware
+
+The **Firmware** section of an open board writes a Rockchip firmware package, or a loader's ID
+block alone. Like the partition table section, it starts closed. Both writes use the same plan
+screen and typed confirmation as any other write. Neither has run against a board
+`[UNVERIFIED]`.
+
+*Plan firmware write...* takes the package chosen in its *Package* row. The whole package is
+read and checked before the board is asked anything, so a large package shows progress first.
+The plan then lists every run in the order it is written:
+
+1. Each partition image, into the partition the package's parameter names
+2. The primary GPT and the backup
+3. The ID block, at sector 64, last
+
+The plan also names the ID block's images, the partitions the board holds afterward, and the
+entries left out. It shows what the loader file claims, and whether the running loader claims
+`NEW_IDB`. [Firmware packages and the ID block](cli/firmware.md) describes each check and each
+refusal.
+
+*Plan ID block write...* takes the file chosen in its *Loader* row: a loader container, or a
+firmware package whose loader is used. It writes the ID block alone, and leaves the partition
+table as it is.
+
+A firmware package and a loader container do not boot when written raw. *Plan a write...*
+refuses either as soon as it reads the file's first bytes, before the board is asked anything.
+
+On a DFU board, both firmware buttons are disabled, and the reason is shown above them.
+
 ## Recovering a StarFive board
 
 StarFive's JH7110 boards, such as the VisionFive 2 and the Milk-V Mars CM, recover over a serial

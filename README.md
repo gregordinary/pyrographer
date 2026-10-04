@@ -55,6 +55,12 @@ Four commands maintain partition tables, in both the GPT and Rockchip's `paramet
 `author-param` write a fresh table from a layout you supply. All four use the same plan,
 confirmation and read-back as `flash`.
 
+Three commands handle what a Rockchip SDK ships. `firmware-info` checks a firmware package, an
+`update.img`, with no device attached. `flash-firmware` writes a package as one plan: its
+partition images, the GPT its parameter describes, and the ID block. `write-idb` writes the ID
+block alone, the first stage the BootROM reads. Both writes use the same gate and read-back as
+`flash`.
+
 Three commands serve one vendor each:
 
 - `db` uploads a loader to a Rockchip board in maskrom, the BootROM's USB download mode.

@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, IsTerminal, Write};
+use std::io::{BufReader, BufWriter, IsTerminal, Read, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -18,10 +18,12 @@ use pyrographer_core::block::{self, BlockDevice};
 use pyrographer_core::bootstrap::ingenic::{IngenicLoader, Stage};
 use pyrographer_core::codec::console as console_codec;
 use pyrographer_core::codec::rkboot;
+use pyrographer_core::codec::rkfw;
 use pyrographer_core::codec::rockusb::{ResetMode, StorageMedium};
 use pyrographer_core::console::{self, Seen};
 use pyrographer_core::discovery::{self, DeviceInfo, Mode};
 use pyrographer_core::fill::FillReport;
+use pyrographer_core::firmware::{self, Package};
 use pyrographer_core::image::{SyncReader, SyncWriter};
 use pyrographer_core::layout::Layout;
 use pyrographer_core::partition::{Partition, PartitionTable, TableFormat};
@@ -31,7 +33,8 @@ use pyrographer_core::soc::Soc;
 use pyrographer_core::transport::{DEFAULT_BAUD, SerialTransport, UsbTransport};
 use pyrographer_core::uboot::{BootPlan, Gadget, GadgetDevice, UBoot};
 use pyrographer_core::verbs::{
-    ClonePlan, ParamAuthorSource, ParamMedium, SegmentedPlan, TableAction, Touches, WritePlan,
+    ClonePlan, FirmwarePlan, FirmwareWrite, LoaderCapability, ParamAuthorSource, ParamMedium,
+    SegmentedPlan, TableAction, Touches, WritePlan,
 };
 use pyrographer_core::{Error, Result, verbs};
 
@@ -70,6 +73,13 @@ COMMANDS:
                                   layout (needs --soc, see AUTHOR OPTIONS)
     author-gpt                    Write a fresh GPT from a layout (needs --soc,
                                   see AUTHOR OPTIONS)
+    write-idb --loader <file>     Write a loader's ID block at sector 64: the
+                                  first stage the BootROM reads (needs --soc)
+    firmware-info <file>          Read and check a Rockchip firmware package
+                                  (update.img), and report what it holds
+    flash-firmware <file>         Write a Rockchip firmware package: every
+                                  partition image, the GPT its parameter
+                                  describes, and the ID block (needs --soc)
     verify <lba> <file>           Compare the flash at <lba> against a file
     reset                         Reboot the connected device, or end its session
                                   another way (see RESET OPTIONS)
@@ -99,7 +109,9 @@ OPTIONS:
                                   `_loader.bin` for the board's SoC. The SoC
                                   knowledge lives in this file, not in pyrographer.
                                   `db` prints the SoC the container says it was
-                                  built for before uploading anything.
+                                  built for before uploading anything. `db` and
+                                  `write-idb` also take a firmware package
+                                  (update.img), and use the loader inside it.
 
     --code471 <file>              Raw download-boot stages for `db`, in place of
     --code472 <file>              --loader: the bare 471 (DRAM init) and 472
@@ -154,7 +166,8 @@ BLOCK DEVICES:
     command opens the device, even to build a plan, and opening it needs root or
     membership of the `disk` group. Linux only.
 
-WRITE OPTIONS (flash, clone, repair-table, repair-param, author-param, author-gpt):
+WRITE OPTIONS (flash, clone, repair-table, repair-param, author-param, author-gpt,
+               write-idb, flash-firmware):
     --soc <soc>                   The SoC the board being written is, like rk3576.
                                   Every write is gated on the running loader's own
                                   answer matching it, byte for byte. Without it,
@@ -296,9 +309,24 @@ brings a board to a usable mode.
 clone needs both boards named, even when only two are connected. That choice
 decides which board is overwritten, so clone does not infer it.
 
-flash, clone, repair-table, repair-param, author-param, and author-gpt overwrite a
-board. They read back every window they write, and that cannot be turned off.
-Nothing they do can be undone.
+flash, clone, repair-table, repair-param, author-param, author-gpt, write-idb, and
+flash-firmware overwrite a board. They read back every window they write, and
+that cannot be turned off. Nothing they do can be undone.
+
+flash-firmware writes a Rockchip firmware package (update.img) as one plan. It
+reads the whole package first and checks it: the archive's checksum, the loader
+the ID block is built from, and every hash the ID block's header records. Then it
+writes each partition image into the partition the package's parameter names, a
+GPT built from that parameter, and the ID block, last. A board in maskrom takes
+`db --loader update.img` first. firmware-info makes the same checks with no
+device.
+
+write-idb builds the ID block from a loader container's flash stages, each placed
+where the container's own RKNS header says, and writes it at sector 64. It writes
+through a loader that claims NEW_IDB, which `capability` reports.
+
+flash refuses a firmware package or a loader container written raw, because
+neither boots that way.
 
 repair-table rewrites whichever copy of a GPT is damaged from the intact one: a
 damaged primary from the backup in the last sector, or a stale, damaged, or
@@ -439,6 +467,9 @@ fn run() -> Run {
         Some("repair-param") => cmd_repair_param(args),
         Some("author-param") => cmd_author_param(args),
         Some("author-gpt") => cmd_author_gpt(args),
+        Some("write-idb") => cmd_write_idb(args),
+        Some("firmware-info") => cmd_firmware_info(args),
+        Some("flash-firmware") => cmd_flash_firmware(args),
         Some("recover") => cmd_recover(args),
         Some("console") => cmd_console(args),
         Some("uboot") => cmd_uboot(args),
@@ -1049,6 +1080,10 @@ fn cmd_flash(mut args: pico_args::Arguments) -> Run {
         soc,
     } = parse_flash(&mut args)?;
     no_more(args)?;
+
+    // A package or a loader container written raw is refused before a device is
+    // chosen. `flash` makes the same refusal on the image's first bytes.
+    refuse_container(&path)?;
 
     let file = File::open(&path).map_err(|e| Error::Io(format!("cannot open {path}: {e}")))?;
     let image_bytes = file
@@ -2231,6 +2266,526 @@ fn cmd_author_gpt(mut args: pico_args::Arguments) -> Run {
     Ok(())
 }
 
+/// Read a loader container from `path`, or the loader inside a firmware package.
+///
+/// A firmware package carries the loader it was built with, so `db` and `write-idb`
+/// take the package itself and nobody extracts the loader by hand. Core reads only
+/// the package's header and its loader, because a package is gigabytes.
+fn read_loader(path: &str) -> std::result::Result<rkboot::LoaderImage, CliError> {
+    let file = File::open(path).map_err(|e| Error::Io(format!("cannot open {path}: {e}")))?;
+    let file_bytes = file
+        .metadata()
+        .map_err(|e| Error::Io(format!("cannot measure {path}: {e}")))?
+        .len();
+    let mut image = SyncReader::new(BufReader::new(file));
+    let found = pollster::block_on(firmware::read_loader(&mut image, file_bytes))?;
+    if found.in_package {
+        println!("Using the loader inside the firmware package {path}.");
+    }
+    Ok(found.loader)
+}
+
+/// Say what a loader file claims to be for, before anything is opened.
+///
+/// A container names the SoC it was built for, and printing it turns "which of
+/// these six loaders is the RK3576 one" from a guess into a thing a person can
+/// read. A file that claims nothing, bare stage blobs, says so rather than staying
+/// silent, because silence would read as a check that passed.
+fn print_loader_claim(loader: &rkboot::LoaderImage) {
+    match loader.chip {
+        Some(_) => println!(
+            "This loader's chip field holds {}.",
+            loader_claim(loader.chip)
+        ),
+        None => println!(
+            "These are bare stage files, which carry no container and so name no SoC. \
+             Nothing checks which board they are for."
+        ),
+    }
+}
+
+/// A loader container's claim about its SoC, as a plan or a report prints it.
+fn loader_claim(chip: Option<[u8; 4]>) -> String {
+    match chip {
+        Some(chip) => {
+            let claim = match pyrographer_core::soc::by_container_chip(&chip) {
+                Some(named) => named.name().to_string(),
+                None => "no pinned SoC".to_string(),
+            };
+            format!("{} \"{}\" ({claim})", hex(&chip), ascii(&chip))
+        }
+        None => "nothing: bare stage files carry no container".to_string(),
+    }
+}
+
+/// Refuse a file that is a container a tool unpacks, before a device is chosen.
+///
+/// Core's [`verbs::image_refusal`] judges the file's first bytes, and `flash`
+/// makes the same refusal on the image it is given. Asked here first, the person
+/// is told which command writes what they picked.
+fn refuse_container(path: &str) -> std::result::Result<(), CliError> {
+    let mut head = Vec::with_capacity(verbs::CONTAINER_MAGIC_LEN);
+    File::open(path)
+        .and_then(|file| {
+            file.take(verbs::CONTAINER_MAGIC_LEN as u64)
+                .read_to_end(&mut head)
+        })
+        .map_err(|e| Error::Io(format!("cannot read {path}: {e}")))?;
+    let Some(refusal) = verbs::image_refusal(&head) else {
+        return Ok(());
+    };
+    let next = match rkfw::identify(&head) {
+        Some(rkfw::Container::Package) => {
+            "Run `pyrographer flash-firmware <file>` to write a firmware package."
+        }
+        Some(rkfw::Container::Archive) => {
+            "A bare archive is the inner layer of an update.img. Run `pyrographer \
+             flash-firmware` on the package it came from."
+        }
+        Some(rkfw::Container::Loader) | None => {
+            "Run `pyrographer write-idb --loader <file>` to write its ID block, or \
+             `pyrographer db --loader <file>` to upload it to a board in maskrom."
+        }
+    };
+    Err(CliError::Usage(format!("{refusal}. {next}")))
+}
+
+/// Read and check the firmware package at `path`: the one forward pass, with its
+/// progress on the terminal.
+///
+/// The whole file is read before a device is chosen, so a damaged or incomplete
+/// download is refused with nothing opened.
+fn read_firmware(path: &str) -> std::result::Result<Package, CliError> {
+    let file = File::open(path).map_err(|e| Error::Io(format!("cannot open {path}: {e}")))?;
+    let file_bytes = file
+        .metadata()
+        .map_err(|e| Error::Io(format!("cannot measure {path}: {e}")))?
+        .len();
+    let mut image = SyncReader::new(BufReader::new(file));
+    let mut render = ProgressRenderer::new("Checking", "Checked");
+    let cancel = Cancel::new();
+    Ok(pollster::block_on(firmware::read(
+        &mut image,
+        file_bytes,
+        &mut |event| render.render(event),
+        &cancel,
+    ))?)
+}
+
+/// Read and check a firmware package, and report what it holds. No device.
+fn cmd_firmware_info(mut args: pico_args::Arguments) -> Run {
+    let path: String = args.free_from_str().map_err(|e| {
+        CliError::Usage(format!(
+            "firmware-info needs a firmware package to read: {e}"
+        ))
+    })?;
+    no_more(args)?;
+
+    let package = read_firmware(&path)?;
+    print!("{}", render_package(&path, &package));
+    Ok(())
+}
+
+/// The size `firmware-info` lays a package's parameter out against.
+///
+/// It is far larger than any eMMC, so every offset fits, and the partition that
+/// grows can be recognized and described as growing rather than given a length.
+const NOMINAL_SECTORS: u64 = 1 << 40;
+
+/// Render a checked firmware package for `firmware-info`.
+fn render_package(path: &str, package: &Package) -> String {
+    let header = &package.header;
+    let archive = &package.archive;
+    let release = header.release;
+
+    let mut rows: Vec<(&str, Vec<String>)> = vec![
+        ("model", vec![archive.model.clone()]),
+        ("made by", vec![archive.manufacturer.clone()]),
+        (
+            "version",
+            vec![format!(
+                "{}, built {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                rkfw::version_text(header.version),
+                release.year,
+                release.month,
+                release.day,
+                release.hour,
+                release.minute,
+                release.second
+            )],
+        ),
+        (
+            "chip field",
+            vec![format!("{} (reported, not compared)", hex(&header.chip))],
+        ),
+        (
+            "loader",
+            vec![format!(
+                "{} at byte {}, naming {}",
+                human_bytes(header.loader.len),
+                header.loader.offset,
+                loader_claim(package.loader.chip)
+            )],
+        ),
+        (
+            "archive",
+            vec![format!(
+                "{} at byte {}, and its checksum holds",
+                human_bytes(header.archive.len),
+                header.archive.offset
+            )],
+        ),
+        (
+            "trailer",
+            vec![match (package.trailer_text(), &package.trailer) {
+                (Some(text), _) => format!("MD5 {text}, reported and not checked"),
+                (None, Some(bytes)) => format!("{}, reported and not checked", hex(bytes)),
+                (None, None) => "none".to_string(),
+            }],
+        ),
+    ];
+
+    let id_block = &package.id_block;
+    let mut idb_lines = vec![format!(
+        "{} sectors, laid out by the {} header, every hash checked",
+        id_block.sectors(),
+        id_block.header_stage
+    )];
+    idb_lines.extend(id_block.images.iter().map(render_id_block_image));
+    rows.push(("ID block", idb_lines));
+
+    let partitions = match package.layout(NOMINAL_SECTORS) {
+        Ok(layout) => {
+            let (_, last_usable) =
+                pyrographer_core::codec::gpt::usable_range(NOMINAL_SECTORS, 512).unwrap_or((0, 0));
+            layout
+                .partitions
+                .iter()
+                .map(|part| {
+                    let extent = if part.first_lba + part.sectors == last_usable + 1 {
+                        format!("from LBA {}, growing to fill the device", part.first_lba)
+                    } else {
+                        format!("{} sectors at LBA {}", part.sectors, part.first_lba)
+                    };
+                    match &part.unique_guid {
+                        Some(guid) => format!("{:<16} {extent}, GUID {guid}", part.name),
+                        None => format!("{:<16} {extent}", part.name),
+                    }
+                })
+                .collect()
+        }
+        Err(error) => vec![error.to_string()],
+    };
+    rows.push(("partitions", partitions));
+
+    rows.push((
+        "images",
+        package
+            .images
+            .iter()
+            .map(|image| {
+                format!(
+                    "{:<16} {} from {}",
+                    image.name,
+                    human_bytes(image.bytes),
+                    image.path
+                )
+            })
+            .collect(),
+    ));
+    if !package.skipped.is_empty() {
+        rows.push((
+            "not written",
+            package
+                .skipped
+                .iter()
+                .map(|skipped| format!("{}: {}", skipped.name, skipped.why))
+                .collect(),
+        ));
+    }
+
+    let body: String = rows
+        .iter()
+        .map(|(label, lines)| render_column(label, lines))
+        .collect();
+    format!(
+        "\n{path}: a Rockchip firmware package, {}.\n\n{body}\nEvery check passed: the \
+         archive's checksum, the two copies of the loader, the ID block's hashes, and the \
+         parameter's checksum.\n",
+        human_bytes(package.file_bytes)
+    )
+}
+
+/// One image of an ID block, as a plan or a report lists it.
+fn render_id_block_image(image: &pyrographer_core::codec::idb::IdbImage) -> String {
+    let load = image
+        .load_address
+        .map(|address| format!(", loads at {address:#010x}"))
+        .unwrap_or_default();
+    format!(
+        "{} at sector {}, {} sectors{load}",
+        image.stage, image.sector, image.sectors
+    )
+}
+
+/// Write a firmware package: every partition image, the GPT its parameter
+/// describes, and the ID block.
+fn cmd_flash_firmware(mut args: pico_args::Arguments) -> Run {
+    let yes = args.contains("--yes");
+    let dry_run = args.contains("--dry-run");
+    let selector = device_option(&mut args)?;
+    let soc = soc_option(&mut args)?;
+    let path: String = args.free_from_str().map_err(|e| {
+        CliError::Usage(format!(
+            "flash-firmware needs a firmware package to write: {e}"
+        ))
+    })?;
+    no_more(args)?;
+
+    // The package first, read and checked whole, before a device is chosen.
+    let package = read_firmware(&path)?;
+
+    let device = choose_target(selector.as_ref())?;
+    device.reject_soc(soc)?;
+    let mut render = ProgressRenderer::new("Writing", "Wrote");
+    let cancel = Cancel::new();
+
+    pollster::block_on(async {
+        let mut agent = device.open().await?;
+        let plan = verbs::plan_firmware(&mut agent, &package, soc).await?;
+        execute_firmware_write(
+            &mut agent,
+            &device,
+            Some(&path),
+            plan,
+            dry_run,
+            yes,
+            &mut render,
+            &cancel,
+        )
+        .await
+    })?;
+    Ok(())
+}
+
+/// Write a loader's ID block at sector 64, and nothing else.
+fn cmd_write_idb(mut args: pico_args::Arguments) -> Run {
+    let yes = args.contains("--yes");
+    let dry_run = args.contains("--dry-run");
+    let selector = device_option(&mut args)?;
+    let soc = soc_option(&mut args)?;
+    let loader_path: String = args.value_from_str("--loader").map_err(|e| {
+        CliError::Usage(format!(
+            "write-idb needs --loader <file>, a loader container or a firmware package: {e}"
+        ))
+    })?;
+    no_more(args)?;
+
+    // The loader is read, its claim printed and judged, and its ID block built,
+    // before a device is chosen: a file that cannot make one has cost no open.
+    let loader = read_loader(&loader_path)?;
+    print_loader_claim(&loader);
+    if let Some(refusal) = verbs::loader_blob_refusal(soc, &loader) {
+        return Err(refusal.into());
+    }
+    pyrographer_core::codec::idb::build(&loader)?;
+
+    let device = choose_target(selector.as_ref())?;
+    device.reject_soc(soc)?;
+    let mut render = ProgressRenderer::new("Writing", "Wrote");
+    let cancel = Cancel::new();
+
+    pollster::block_on(async {
+        let mut agent = device.open().await?;
+        let plan = verbs::plan_write_id_block(&mut agent, &loader, soc).await?;
+        execute_firmware_write(
+            &mut agent,
+            &device,
+            None,
+            plan,
+            dry_run,
+            yes,
+            &mut render,
+            &cancel,
+        )
+        .await
+    })?;
+    Ok(())
+}
+
+/// The steps a firmware plan goes through once it exists: show it, stop for a dry
+/// run, ask the gate, ask the person, write.
+///
+/// `package` is the path of the package a package plan streams from. The file is
+/// opened again for the write and read forward from its first byte.
+#[allow(clippy::too_many_arguments)]
+async fn execute_firmware_write(
+    agent: &mut FlashAgent<UsbTransport>,
+    device: &Chosen,
+    package: Option<&str>,
+    plan: FirmwarePlan,
+    dry_run: bool,
+    yes: bool,
+    render: &mut ProgressRenderer,
+    cancel: &Cancel,
+) -> std::result::Result<(), CliError> {
+    print!("{}", render_firmware_plan(device, package, &plan));
+
+    if dry_run {
+        println!("Dry run: nothing was written.");
+        return Ok(());
+    }
+
+    // Asked before the prompt, so nobody confirms a write that was never going to
+    // run. The write makes the same refusal from the same function.
+    if let Some(refused) = verbs::firmware_refusal(agent, &plan) {
+        return Err(refused.into());
+    }
+
+    if !confirmed(yes)? {
+        println!("Nothing was written.");
+        return Ok(());
+    }
+
+    let closing = match &plan.what {
+        FirmwareWrite::Package { .. } => format!(
+            "Wrote {} runs from {} and read every window back.",
+            plan.runs.len(),
+            package.unwrap_or("the package")
+        ),
+        FirmwareWrite::IdBlock => {
+            "Wrote the ID block at sector 64 and read every window of it back.".to_string()
+        }
+    };
+
+    match package {
+        Some(path) => {
+            let file =
+                File::open(path).map_err(|e| Error::Io(format!("cannot open {path}: {e}")))?;
+            let mut image = SyncReader::new(BufReader::new(file));
+            verbs::write_firmware(
+                agent,
+                plan.confirm(),
+                Some(&mut image),
+                &mut |event| render.render(event),
+                cancel,
+            )
+            .await?;
+        }
+        None => {
+            verbs::write_firmware(
+                agent,
+                plan.confirm(),
+                None,
+                &mut |event| render.render(event),
+                cancel,
+            )
+            .await?;
+        }
+    }
+
+    println!("{closing}");
+    Ok(())
+}
+
+/// Render a [`FirmwarePlan`] for a person about to allow it.
+///
+/// A firmware write is a write, so this shows what a write's plan shows: which
+/// device, its geometry, the gate's evidence and verdict, and when the write is
+/// read back. It also shows what is particular to it: every run in the order it is
+/// written, the images the ID block holds and where, the partitions the table
+/// holds afterward, the entries left out and why, what the loader file claims, and
+/// what the running loader said it can do.
+fn render_firmware_plan(device: &Chosen, package: Option<&str>, plan: &FirmwarePlan) -> String {
+    let sector_size = u64::from(plan.flash.sector_size);
+    let (head, table_note) = match &plan.what {
+        FirmwareWrite::Package {
+            model,
+            manufacturer,
+            version,
+        } => (
+            format!(
+                "This will write the firmware package {} to {}:\n{model} by {manufacturer}, \
+                 version {}.\n",
+                package.unwrap_or("(unnamed)"),
+                device.subject_short(),
+                rkfw::version_text(*version)
+            ),
+            "The package's partition table replaces the device's.",
+        ),
+        FirmwareWrite::IdBlock => (
+            format!(
+                "This will write an ID block to {}.\n",
+                device.subject_short()
+            ),
+            "The partition table is left as it is.",
+        ),
+    };
+
+    let run_lines: Vec<String> = plan
+        .runs
+        .iter()
+        .flat_map(|run| {
+            let last = (run.lba + run.sectors).saturating_sub(1);
+            [
+                run.what.clone(),
+                format!(
+                    "LBA {} through {last} ({} sectors), {}",
+                    run.lba,
+                    run.sectors,
+                    human_bytes(run.bytes)
+                ),
+            ]
+        })
+        .collect();
+    let mut id_block_lines = vec![format!(
+        "laid out by the {} header, every hash checked",
+        plan.id_block_header
+    )];
+    id_block_lines.extend(plan.id_block_images.iter().map(render_id_block_image));
+
+    let mut out = format!("\n{head}\n");
+    out += &render_column("writing", &run_lines);
+    out += &render_column("ID block", &id_block_lines);
+    out += &render_column("partitions", &render_partition_lines(&plan.partitions));
+    if !plan.skipped.is_empty() {
+        let skipped: Vec<String> = plan
+            .skipped
+            .iter()
+            .map(|skipped| format!("{}: {}", skipped.name, skipped.why))
+            .collect();
+        out += &render_column("not written", &skipped);
+    }
+    out += &render_column("loader file", &[loader_claim(plan.loader_chip)]);
+    let capability = match &plan.capability {
+        LoaderCapability::NoLoader => None,
+        LoaderCapability::Answered(capability) if capability.new_idb() => {
+            Some("NEW_IDB set: the loader writes an RKNS ID block".to_string())
+        }
+        LoaderCapability::Answered(_) => {
+            Some("NEW_IDB not set: the write will be refused".to_string())
+        }
+        LoaderCapability::NotAnswered(why) => {
+            Some(format!("no answer ({why}): the write will be refused"))
+        }
+    };
+    if let Some(line) = capability {
+        out += &render_column("capability", &[line]);
+    }
+    out += &format!(
+        "  {:<12} {} ({} sectors of {sector_size} bytes)\n",
+        device.medium_word(),
+        human_bytes(plan.flash.size_bytes),
+        plan.flash.size_bytes / sector_size
+    );
+    out += &device.render_gate(&plan.soc, &plan.chip_version);
+    out += &format!(
+        "\n{table_note} {}\nNothing here can be undone.\n",
+        plan.read_back.describe()
+    );
+    out
+}
+
 /// What `verify` reads off the command line.
 #[derive(Debug, PartialEq, Eq)]
 struct VerifyArgs {
@@ -2455,11 +3010,7 @@ fn cmd_db(mut args: pico_args::Arguments) -> Run {
     // BootROM gets -- so for those the only thing to catch here is a file that
     // cannot be read.
     let loader = match source {
-        DbSource::Container(path) => {
-            let bytes =
-                std::fs::read(&path).map_err(|e| Error::Io(format!("cannot read {path}: {e}")))?;
-            rkboot::parse(&bytes)?
-        }
+        DbSource::Container(path) => read_loader(&path)?,
         DbSource::Raw { code_471, code_472 } => {
             let read = |path: String| -> Result<(String, Vec<u8>)> {
                 let bytes = std::fs::read(&path)
@@ -2474,28 +3025,8 @@ fn cmd_db(mut args: pico_args::Arguments) -> Run {
     };
 
     // Say what the file claims, before anything is opened and whether or not a
-    // SoC was named. A container names the SoC it was built for, and printing it
-    // is what turns "which of these six loaders is the RK3576 one" from a guess
-    // into a thing the person can read. A file that claims nothing -- bare stage
-    // blobs -- says so rather than staying silent, because silence would read as
-    // a check that passed.
-    match loader.chip {
-        Some(chip) => {
-            let claim = match pyrographer_core::soc::by_container_chip(&chip) {
-                Some(named) => named.name().to_string(),
-                None => "no pinned SoC".to_string(),
-            };
-            println!(
-                "This loader's chip field holds {} \"{}\" ({claim}).",
-                hex(&chip),
-                ascii(&chip)
-            );
-        }
-        None => println!(
-            "These are bare stage files, which carry no container and so name no SoC. \
-             Nothing checks which board they are for."
-        ),
-    }
+    // SoC was named.
+    print_loader_claim(&loader);
     // Refuse a file built for another SoC before a device is opened. The upload
     // is the one write-shaped act with nothing to read back afterwards, so this
     // is the only place the question can be asked at all.
@@ -5582,6 +6113,159 @@ mod tests {
             ResetMode::PowerOff,
         ] {
             assert_eq!(reset_next_step(mode), None, "{}", mode.name());
+        }
+    }
+
+    /// A firmware plan as one of the scripted RK3576 plans would carry it: a
+    /// partition image, both GPT copies, and the ID block, with the loader's
+    /// capability reply set as the test needs.
+    fn a_firmware_plan(what: FirmwareWrite, capability: LoaderCapability) -> FirmwarePlan {
+        use pyrographer_core::codec::idb::IdbImage;
+        use pyrographer_core::verbs::{Run, RunSource};
+
+        let run = |what: &str, lba: u64, sectors: u64, source: RunSource| Run {
+            what: what.to_string(),
+            lba,
+            bytes: sectors * 512,
+            sectors,
+            source,
+            touches: Touches::Partitions(Vec::new()),
+        };
+        FirmwarePlan {
+            what,
+            runs: vec![
+                run(
+                    "partition 'boot' from Image/boot.img",
+                    0xa000,
+                    2048,
+                    RunSource::Package { offset: 4096 },
+                ),
+                run("the primary GPT", 0, 34, RunSource::Held(vec![0; 34 * 512])),
+                run(
+                    "the ID block, 3 images laid out by its RKNS header",
+                    64,
+                    704,
+                    RunSource::Held(vec![0; 704 * 512]),
+                ),
+            ],
+            partitions: vec![Partition {
+                name: "boot".to_string(),
+                first_lba: 0xa000,
+                sectors: 0x20000,
+            }],
+            skipped: vec![pyrographer_core::firmware::Skipped {
+                name: "package-file".to_string(),
+                path: "package-file".to_string(),
+                why: "the entry is the packing tool's own list of files",
+            }],
+            id_block_header: "FlashHead".to_string(),
+            id_block_images: vec![IdbImage {
+                stage: "FlashBoost".to_string(),
+                sector: 8,
+                sectors: 8,
+                load_address: Some(0x3ffc_0000),
+            }],
+            loader_chip: Some(*b"6753"),
+            capability,
+            flash: FlashInfo {
+                size_bytes: 122_142_720 * 512,
+                sector_size: 512,
+                medium: None,
+                chip_id: None,
+            },
+            chip_version: vec![0x36, 0x37, 0x35, 0x33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            soc: Some(Soc::parse("rk3576").expect("pinned")),
+            read_back: ReadBack::PerWindow,
+        }
+    }
+
+    /// A package plan shows everything a person checks before the board's boot
+    /// chain, table and partitions are replaced: the package, every run and where
+    /// it lands, the ID block's images, the resulting table, what is left out,
+    /// what the loader file claims, what the loader said it can do, and the gate.
+    #[test]
+    fn the_firmware_plan_shows_every_run_and_what_gates_it() {
+        let new_idb = pyrographer_core::codec::rockusb::parse_capability(&[0, 1, 0, 0, 0, 0, 0, 0])
+            .expect("eight bytes");
+        let plan = a_firmware_plan(
+            FirmwareWrite::Package {
+                model: "RK3576".to_string(),
+                manufacturer: "rockchip".to_string(),
+                version: 0x0102_0003,
+            },
+            LoaderCapability::Answered(new_idb),
+        );
+        let rendered = render_firmware_plan(&a_chosen_board(), Some("update.img"), &plan);
+
+        for wanted in [
+            "firmware package update.img to 2207:350e",
+            "RK3576 by rockchip, version 1.2.3",
+            "partition 'boot' from Image/boot.img",
+            "LBA 40960 through 43007 (2048 sectors)",
+            "LBA 64 through 767 (704 sectors)",
+            "FlashBoost at sector 8, 8 sectors, loads at 0x3ffc0000",
+            "laid out by the FlashHead header, every hash checked",
+            "package-file: the entry is the packing tool's own list of files",
+            "36 37 35 33 \"6753\" (rk3576)",
+            "NEW_IDB set",
+            "rk3576: the loader's answer matches",
+            "The package's partition table replaces the device's",
+            "Nothing here can be undone",
+        ] {
+            assert!(
+                rendered.contains(wanted),
+                "missing {wanted:?} in:\n{rendered}"
+            );
+        }
+    }
+
+    /// An ID block plan says the table is left alone, and a loader that did not
+    /// answer the capability query is shown as the refusal it becomes.
+    #[test]
+    fn an_id_block_plan_shows_the_table_is_left_and_the_capability_refusal() {
+        let plan = a_firmware_plan(
+            FirmwareWrite::IdBlock,
+            LoaderCapability::NotAnswered("the command failed".to_string()),
+        );
+        let rendered = render_firmware_plan(&a_chosen_board(), None, &plan);
+        assert!(
+            rendered.contains("write an ID block to 2207:350e"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("left as it is"), "{rendered}");
+        assert!(
+            rendered.contains("no answer (the command failed): the write will be refused"),
+            "{rendered}"
+        );
+    }
+
+    /// `flash` refuses a container by its first bytes, before a device is chosen,
+    /// and names the command that writes what was picked. An ordinary image, and
+    /// one too short to begin a container, pass.
+    #[test]
+    fn flash_refuses_a_container_before_choosing_a_device() {
+        let dir = std::env::temp_dir();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(format!("pyrographer-cli-{name}-{}", std::process::id()));
+            std::fs::write(&path, bytes).expect("a scratch file");
+            path.display().to_string()
+        };
+
+        let package = write("package", b"RKFW and the rest");
+        let error = refuse_container(&package).expect_err("a package");
+        assert!(error.to_string().contains("flash-firmware"), "{error}");
+
+        let loader = write("loader", b"LDR and the rest");
+        let error = refuse_container(&loader).expect_err("a loader container");
+        assert!(error.to_string().contains("write-idb"), "{error}");
+
+        let image = write("image", b"ANDROID! boot image");
+        refuse_container(&image).expect("an ordinary image");
+        let tiny = write("tiny", b"RK");
+        refuse_container(&tiny).expect("two bytes begin nothing");
+
+        for path in [package, loader, image, tiny] {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
