@@ -115,10 +115,14 @@ jobs:
 
       # Pinned, because `~/.cargo/bin` is cached: an unpinned install keeps
       # whichever mdbook first landed there, and that is not a version anybody
-      # chose. With the pin, a cached copy of the same release makes this a no-op.
+      # chose. The cache holds the binary but not cargo's record of installing
+      # it, and `cargo install` refuses to overwrite a binary it has no record
+      # of. So the step asks the cached binary its version, and installs only
+      # when that is not the pinned release.
       - name: Book
         run: |
-          cargo install mdbook --locked --version 0.5.4
+          mdbook --version 2>/dev/null | grep -qx 'mdbook v0.5.4' \
+            || cargo install mdbook --locked --version 0.5.4 --force
           mdbook build docs
 
       # The book this job just built is the book that gets published, so a page
