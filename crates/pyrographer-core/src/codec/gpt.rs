@@ -763,6 +763,18 @@ pub const LINUX_SWAP: Guid = Guid([
     0x6d, 0xfd, 0x57, 0x06, 0xab, 0xa4, 0xc4, 0x43, 0x84, 0xe5, 0x09, 0x33, 0xc8, 0x4b, 0x4f, 0x4f,
 ]);
 
+/// The partition the JH7110 boot ROM loads its SPL from in SD mode,
+/// `2E54B353-1271-4842-806F-E436D6AF6985`.
+///
+/// The ROM finds the partition by this type GUID. StarFive's VisionFive 2 SDK gives
+/// it to the `spl` partition at 2 MiB, which holds a `.normal.out`. **\[DOC\]**
+///
+/// [`type_guid_for`] maps the token `jh7110-spl` to it. The token names the SoC,
+/// because the meaning is that SoC's ROM's.
+pub const JH7110_SPL: Guid = Guid([
+    0x53, 0xb3, 0x54, 0x2e, 0x71, 0x12, 0x42, 0x48, 0x80, 0x6f, 0xe4, 0x36, 0xd6, 0xaf, 0x69, 0x85,
+]);
+
 /// The type GUID a layout's type token names.
 ///
 /// The vocabulary of GPT partition types lives here, with the format that uses it.
@@ -770,7 +782,8 @@ pub const LINUX_SWAP: Guid = Guid([
 /// The token resolves three ways:
 ///
 /// - A small named set covers the types an embedded board's layout uses: `esp` or
-///   `efi`, `linux` or `data`, and `swap`. The names match in any case.
+///   `efi`, `linux` or `data`, `swap`, and `jh7110-spl`. The names match in any
+///   case.
 /// - Any other token is read as a raw type GUID, so any type can be named.
 /// - A partition whose layout named no type (`None`) gets [`LINUX_DATA`], the
 ///   default.
@@ -788,13 +801,14 @@ pub fn type_guid_for(kind: Option<&str>) -> Result<Guid> {
         "linux" | "data" => LINUX_DATA,
         "esp" | "efi" => EFI_SYSTEM,
         "swap" => LINUX_SWAP,
+        "jh7110-spl" => JH7110_SPL,
         // Anything else is read as a raw type GUID -- any type is nameable, at the
         // cost of naming it in full. A token that is not a GUID either is refused
         // here, with both what it was and what it could have been.
         _ => Guid::parse(token).map_err(|_| {
             Error::InvalidRequest(format!(
                 "'{token}' is not a known partition type or a type GUID. Use one of linux, data, \
-                 esp, efi, swap, or a GUID like {LINUX_DATA}"
+                 esp, efi, swap, jh7110-spl, or a GUID like {LINUX_DATA}"
             ))
         })?,
     })
@@ -940,6 +954,22 @@ pub fn usable_range(flash_sectors: u64, sector_size: usize) -> Result<(u64, u64)
             ))
         })?;
     Ok((first_usable, last_usable))
+}
+
+/// Where a partition marked to grow ends in an authored GPT: one past the last
+/// sector of [`usable_range`].
+///
+/// A layout's `-` size grows a partition to the end of the part. A GPT keeps its
+/// backup in the part's last sectors, so a partition grown to the last sector
+/// overlaps it, and [`author`] refuses the table. The layout parsers take this
+/// value as the end a growing partition stops at, as
+/// [`Layout::parse_native_growing_to`](crate::layout::Layout::parse_native_growing_to)
+/// describes.
+///
+/// A part too small to hold a table and its backup is an [`Error::InvalidRequest`].
+pub fn grow_end(flash_sectors: u64, sector_size: usize) -> Result<u64> {
+    let (_, last_usable) = usable_range(flash_sectors, sector_size)?;
+    Ok(last_usable + 1)
 }
 
 /// Author a fresh GPT from a resolved partition list: a protective MBR, a primary,
@@ -1834,6 +1864,11 @@ mod tests {
             Guid::parse("0657FD6D-A4AB-43C4-84E5-0933C84B4F4F").unwrap(),
             LINUX_SWAP
         );
+        // The SDK's genimage.cfg and Makefile print this one.
+        assert_eq!(
+            Guid::parse("2E54B353-1271-4842-806F-E436D6AF6985").unwrap(),
+            JH7110_SPL
+        );
     }
 
     /// `parse` is the exact inverse of `Display`. It applies the same mixed-endian
@@ -1895,6 +1930,7 @@ mod tests {
         assert_eq!(type_guid_for(Some("esp")).unwrap(), EFI_SYSTEM);
         assert_eq!(type_guid_for(Some("efi")).unwrap(), EFI_SYSTEM);
         assert_eq!(type_guid_for(Some("swap")).unwrap(), LINUX_SWAP);
+        assert_eq!(type_guid_for(Some("JH7110-SPL")).unwrap(), JH7110_SPL);
 
         // A raw type GUID is read as itself, so any type is nameable.
         assert_eq!(

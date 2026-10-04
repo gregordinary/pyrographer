@@ -174,9 +174,8 @@ impl Package {
                 )
             })?;
 
-        let (_, last_usable) = gpt::usable_range(flash_sectors, SECTOR_LEN as usize)?;
-        let partitions =
-            rkparam::parse_mtdparts_growing_to(mtdparts, 0, flash_sectors, last_usable + 1)?;
+        let grow_end = gpt::grow_end(flash_sectors, SECTOR_LEN as usize)?;
+        let partitions = rkparam::parse_mtdparts_growing_to(mtdparts, 0, flash_sectors, grow_end)?;
         let mut layout = Layout {
             partitions: partitions
                 .into_iter()

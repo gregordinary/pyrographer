@@ -70,6 +70,7 @@ use crate::codec::rkboot::LoaderImage;
 use crate::codec::rkfw;
 use crate::codec::rkparam;
 use crate::codec::rockusb;
+use crate::codec::splhdr;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::discovery::{self, DeviceInfo};
 use crate::fill::{FillReport, FillScanner};
@@ -1932,7 +1933,7 @@ pub async fn plan_repair_table<T: Transport>(
     let flash = agent.info().await?;
     let chip_version = agent.chip_version().await?;
 
-    let source =
+    let mut source =
         match partition::read_gpt_repair_source(agent, &flash).await? {
             GptRepair::Repairable(source) => source,
             GptRepair::Healthy => return Err(Error::InvalidRequest(
@@ -1981,6 +1982,10 @@ pub async fn plan_repair_table<T: Transport>(
         partitions: source.partitions.clone(),
         recovery: None,
     });
+    // A rebuilt primary rewrites sector 1, past its header too. A rebuilt backup
+    // lies at the end of the disk, and the helper reads nothing for it.
+    let boot_fixup =
+        keep_boot_fixup(agent, &mut source.rebuilt, flash.sector_size as usize).await?;
     let segment = table_segment(
         rewriting.to_string(),
         source.rebuilt.lba,
@@ -2001,6 +2006,7 @@ pub async fn plan_repair_table<T: Transport>(
         soc,
         read_back,
         segments: vec![segment],
+        boot_fixup,
     })
 }
 
@@ -2058,6 +2064,14 @@ pub struct SegmentedPlan {
     ///
     /// A repair has one per damaged copy, and an authored table has one per copy.
     pub segments: Vec<Segment>,
+    /// The JH7110 boot ROM's eMMC fix-up that the runs carry over, or `None`.
+    ///
+    /// A GPT write whose runs cover the first bytes of the disk reads those bytes
+    /// first. Where the disk carries the fix-up, the runs carry it too, so the ROM
+    /// still finds its SPL after the table is rewritten. It is `Some` only when a
+    /// run covers the fix-up. [`describe_boot_fixup`](Self::describe_boot_fixup)
+    /// states it for a plan.
+    pub boot_fixup: Option<splhdr::DiskFixup>,
 }
 
 /// Whether a [`SegmentedPlan`] repairs a table or authors one, with the detail a
@@ -2084,6 +2098,30 @@ impl SegmentedPlan {
     /// reused for a second.
     pub fn confirm(self) -> ConfirmedSegmentedWrite {
         ConfirmedSegmentedWrite(self)
+    }
+
+    /// The [`boot_fixup`](Self::boot_fixup) this write keeps, as sentences for a
+    /// plan, or `None`.
+    ///
+    /// Both front-ends show these words, so a person reads the same account in
+    /// either. They name the backup address the ROM loads its SPL from, and the
+    /// partition of the written table it falls in.
+    pub fn describe_boot_fixup(&self) -> Option<String> {
+        let fixup = self.boot_fixup?;
+        let offset = u64::from(fixup.backup_offset);
+        let sector = offset / u64::from(self.flash.sector_size.max(1));
+        let place = self
+            .partitions
+            .iter()
+            .find(|part| part.first_lba <= sector && sector < part.end_lba())
+            .map_or_else(
+                || "outside every partition of the table".to_string(),
+                |part| format!("inside partition '{}'", part.name),
+            );
+        Some(format!(
+            "This write keeps the JH7110 boot ROM's eMMC fix-up that the disk carries. The ROM \
+             loads its SPL from byte {offset:#x}, {place}."
+        ))
     }
 }
 
@@ -2204,6 +2242,7 @@ pub async fn plan_repair_param<T: Transport>(
         soc,
         read_back,
         segments,
+        boot_fixup: None,
     })
 }
 
@@ -2413,6 +2452,7 @@ pub async fn plan_author_param<T: Transport>(
         soc,
         read_back,
         segments,
+        boot_fixup: None,
     })
 }
 
@@ -2539,7 +2579,7 @@ pub async fn plan_author_gpt<T: Transport>(
     let sector_size = flash.sector_size as usize;
     let flash_sectors = flash.size_bytes / u64::from(flash.sector_size);
 
-    let authored = author_gpt(layout, flash_sectors, sector_size)?;
+    let mut authored = author_gpt(layout, flash_sectors, sector_size)?;
 
     // The partitions the authored table holds, in the layout's order -- what a person
     // recognizes it by, and what each segment reports it lands beside (which, for the
@@ -2559,6 +2599,9 @@ pub async fn plan_author_gpt<T: Transport>(
         recovery: None,
     });
 
+    // The primary's protective MBR and header sector are where the disk keeps the
+    // JH7110 ROM's fix-up, if it has one.
+    let boot_fixup = keep_boot_fixup(agent, &mut authored.primary, sector_size).await?;
     let primary = table_segment(
         "the primary GPT (protective MBR, header, and entry array from sector 0)".to_string(),
         authored.primary.lba,
@@ -2585,6 +2628,7 @@ pub async fn plan_author_gpt<T: Transport>(
         soc,
         read_back,
         segments: vec![primary, backup],
+        boot_fixup,
     })
 }
 
@@ -2625,6 +2669,56 @@ fn table_segment(
         bytes,
         touches: sized.touches,
     })
+}
+
+/// Carry the JH7110 boot ROM's eMMC fix-up into a GPT run bound for the front of
+/// the disk.
+///
+/// A run that begins past the fix-up's bytes reads nothing and is left as it is.
+/// Otherwise the disk's first sectors are read. Where they carry the fix-up
+/// ([`splhdr::DiskFixup`]), its two words are written into the run, and the fix-up
+/// comes back for the plan to state.
+///
+/// A standard GPT header ends long before the sentinel. A header that declares
+/// itself long enough to reach it cannot hold both, and the plan is refused rather
+/// than lay down a table that fails its own check or drop the fix-up unseen.
+async fn keep_boot_fixup<T: Transport>(
+    agent: &mut FlashAgent<T>,
+    run: &mut gpt::RebuiltGpt,
+    sector_size: usize,
+) -> Result<Option<splhdr::DiskFixup>> {
+    let span = splhdr::DiskFixup::SPAN;
+    let at = run.lba.saturating_mul(sector_size as u64);
+    if at >= span as u64 {
+        return Ok(None);
+    }
+
+    let mut front = vec![0u8; span.div_ceil(sector_size) * sector_size];
+    agent.read(0, &mut front).await?;
+    let Some(fixup) = splhdr::DiskFixup::find(&front) else {
+        return Ok(None);
+    };
+    if !fixup.apply(at, &mut run.bytes) {
+        return Ok(None);
+    }
+
+    // The header sector, wherever it falls in the run, must still pass its check
+    // with the fix-up's bytes in it.
+    let header_at = gpt::HEADER_LBA
+        .checked_sub(run.lba)
+        .map(|sectors| sectors as usize * sector_size);
+    if let Some(index) = header_at
+        && let Some(header) = run.bytes.get(index..index + sector_size)
+        && let Err(error) = gpt::parse_header(header)
+    {
+        return Err(Error::InvalidRequest(format!(
+            "this disk carries the JH7110 boot ROM's eMMC fix-up, and its sentinel at byte \
+             {:#x} lies inside the GPT header this write lays down ({error}). The header and the \
+             fix-up cannot both be kept",
+            splhdr::DiskFixup::SENTINEL_AT
+        )));
+    }
+    Ok(Some(fixup))
 }
 
 /// Write a confirmed table, either a repair's copies or an authored table's, and
@@ -4402,6 +4496,7 @@ mod tests {
                 bytes: vec![0u8; 512],
                 touches: Touches::NoTable,
             }],
+            boot_fixup: None,
         };
         let mut dfu = dfu_board(4, crate::testing::DFU_FULLY_CAPABLE, Vec::new());
 
@@ -5516,9 +5611,11 @@ mod tests {
     /// A board with a damaged primary and an intact backup, and the reads a repair
     /// plan makes to establish that.
     ///
-    /// The reads are the geometry, the loader, the damaged primary, and then the
-    /// backup. It returns the steps and the backup bytes a repair rebuilds from. A
-    /// test computes from them the exact primary the write is expected to lay down.
+    /// The reads are the geometry, the loader, the damaged primary, the backup, and
+    /// then the disk's first two sectors, where a JH7110 eMMC keeps its boot ROM's
+    /// fix-up. This board's carry none. It returns the steps and the backup bytes a
+    /// repair rebuilds from. A test computes from them the exact primary the write
+    /// is expected to lay down.
     fn scripted_repairable(entries: &[Vec<u8>]) -> (Vec<Step>, Vec<u8>, Vec<u8>, u64) {
         let (mut primary, _) = crate::testing::gpt_table(entries);
         primary[0x28] ^= 0xff; // the primary's own header CRC no longer holds
@@ -5538,6 +5635,7 @@ mod tests {
             backup_array_lba,
             backup_array_sector.clone(),
         ));
+        steps.extend(scripted_read(7, 0, vec![0u8; 1024])); // the disk's front
 
         (steps, backup_header, backup_array_sector, backup_lba)
     }
@@ -5590,8 +5688,8 @@ mod tests {
         let (mut steps, backup_header, backup_array, backup_lba) = scripted_repairable(&entries);
 
         // The very bytes the codec will rebuild, so the scripted write and its
-        // read-back assert them. The plan's tags run to 6; `repair_table` re-asks
-        // the loader (7), then writes (8) and reads it back (9).
+        // read-back assert them. The plan's tags run to 7; `repair_table` re-asks
+        // the loader (8), then writes (9) and reads it back (10).
         let rebuilt = crate::codec::gpt::rebuild_primary_from_backup(
             &backup_header,
             &backup_array,
@@ -5601,9 +5699,9 @@ mod tests {
         .expect("a well-formed backup")
         .bytes;
 
-        steps.extend(scripted_chip_version(7));
-        steps.extend(scripted_write(8, 1, rebuilt.clone()));
-        steps.extend(scripted_read(9, 1, rebuilt.clone()));
+        steps.extend(scripted_chip_version(8));
+        steps.extend(scripted_write(9, 1, rebuilt.clone()));
+        steps.extend(scripted_read(10, 1, rebuilt.clone()));
         let mut agent = FlashAgent::Rockusb(RockusbAgent::new(ScriptedTransport::new(steps)));
 
         let soc = Soc::parse("rk3576").expect("pinned");
@@ -5763,9 +5861,9 @@ mod tests {
         let entries = a_boards_partitions();
         let (mut steps, ..) = scripted_repairable(&entries);
         // The re-ask before the write answers as an RK3588, not the RK3576 the
-        // plan named. It is command 7, and the write never reaches command 8.
+        // plan named. It is command 8, and the write never reaches command 9.
         let rk3588 = [0x38, 0x38, 0x35, 0x33, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        steps.extend(scripted_chip_version_of(7, &rk3588));
+        steps.extend(scripted_chip_version_of(8, &rk3588));
         let mut agent = FlashAgent::Rockusb(RockusbAgent::new(ScriptedTransport::new(steps)));
 
         let soc = Soc::parse("rk3576").expect("pinned");
@@ -6135,9 +6233,10 @@ mod tests {
 
         let mut steps = scripted_info(1);
         steps.extend(scripted_chip_version(3));
-        steps.extend(scripted_chip_version(4)); // reverify on the confirmed write
+        steps.extend(scripted_read(4, 0, vec![0u8; 1024])); // the disk's front: no fix-up
+        steps.extend(scripted_chip_version(5)); // reverify on the confirmed write
         let (writes, tag) =
-            scripted_transfer(5, authored.primary.lba, &authored.primary.bytes, true);
+            scripted_transfer(6, authored.primary.lba, &authored.primary.bytes, true);
         steps.extend(writes);
         let (reads, tag) =
             scripted_transfer(tag, authored.primary.lba, &authored.primary.bytes, false);
@@ -6163,6 +6262,7 @@ mod tests {
             "the primary carries the protective MBR from sector 0"
         );
         assert_eq!(plan.partitions.len(), 2);
+        assert_eq!(plan.boot_fixup, None, "the disk carries no fix-up to keep");
         assert!(segmented_refusal(&agent, &plan).is_none());
 
         pollster::block_on(write_table(
@@ -6177,6 +6277,202 @@ mod tests {
             unreachable!("the test built a Rockusb agent")
         };
         agent.transport().assert_drained();
+    }
+
+    // ---- The JH7110 boot ROM's eMMC fix-up, kept across a table write ----
+
+    /// The sectors of the scratch disk the fix-up tests write to: 4 MiB, room for
+    /// an `spl` partition at the 2 MiB the fix-up's backup address names.
+    #[cfg(target_os = "linux")]
+    const FIXUP_DISK_SECTORS: u64 = 0x2000;
+
+    /// The layout the fix-up tests author: StarFive's `spl` partition at 2 MiB,
+    /// then a root partition after it.
+    #[cfg(target_os = "linux")]
+    fn a_jh7110_layout() -> Layout {
+        Layout::parse_native(
+            "spl 0x1000 0x800 jh7110-spl\nroot 0x1800 0x700\n",
+            FIXUP_DISK_SECTORS,
+        )
+        .expect("a well-formed layout")
+    }
+
+    /// A disk image holding the JH7110 layout's table, with the fix-up
+    /// `spl_tool -i` adds to it.
+    #[cfg(target_os = "linux")]
+    fn a_jh7110_disk() -> Vec<u8> {
+        let table =
+            author_gpt(&a_jh7110_layout(), FIXUP_DISK_SECTORS, 512).expect("a well-formed table");
+        let mut disk = vec![0u8; (FIXUP_DISK_SECTORS * 512) as usize];
+        disk[..table.primary.bytes.len()].copy_from_slice(&table.primary.bytes);
+        let at = (table.backup.lba * 512) as usize;
+        disk[at..at + table.backup.bytes.len()].copy_from_slice(&table.backup.bytes);
+        splhdr::DiskFixup {
+            backup_offset: splhdr::DEFAULT_BOFS,
+        }
+        .apply(0, &mut disk);
+        disk
+    }
+
+    /// A block agent over a scratch file holding `disk`.
+    #[cfg(target_os = "linux")]
+    fn a_block_agent_holding(
+        what: &str,
+        disk: &[u8],
+    ) -> (
+        std::path::PathBuf,
+        FlashAgent<crate::transport::testing::ScriptedTransport>,
+    ) {
+        let path =
+            std::env::temp_dir().join(format!("pyrographer-{what}-{}.img", std::process::id()));
+        std::fs::write(&path, disk).expect("a scratch file");
+        let agent = crate::block::agent_over_file(
+            &path,
+            disk.len() as u64,
+            512,
+            crate::block::Access::Write,
+        )
+        .expect("an agent");
+        (path, FlashAgent::Block(agent))
+    }
+
+    /// Authoring a GPT over a disk that carries the JH7110 fix-up keeps it.
+    ///
+    /// The plan reads the disk's front, finds the fix-up, and states it in the
+    /// words both front-ends show. The written disk carries the backup address and
+    /// the sentinel where `spl_tool -i` put them. Its protective MBR and primary
+    /// header are whole, and `spl` carries the type the ROM's SD mode looks for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authoring_a_gpt_keeps_the_jh7110_fixup_the_disk_carries() {
+        let (path, mut agent) = a_block_agent_holding("fixup-author", &a_jh7110_disk());
+        let kept = splhdr::DiskFixup {
+            backup_offset: splhdr::DEFAULT_BOFS,
+        };
+
+        let plan = pollster::block_on(plan_author_gpt(&mut agent, &a_jh7110_layout(), None))
+            .expect("a plan");
+        assert_eq!(plan.boot_fixup, Some(kept));
+        let said = plan.describe_boot_fixup().expect("the plan states it");
+        assert!(
+            said.contains("byte 0x200000") && said.contains("inside partition 'spl'"),
+            "{said}"
+        );
+
+        pollster::block_on(write_table(
+            &mut agent,
+            plan.confirm(),
+            &mut |_| {},
+            &Cancel::new(),
+        ))
+        .expect("written and read back");
+        drop(agent);
+
+        let disk = std::fs::read(&path).expect("the disk");
+        assert_eq!(splhdr::DiskFixup::find(&disk), Some(kept));
+        assert_eq!(disk[0x1be + 4], 0xee, "the protective partition record");
+        assert_eq!(&disk[510..512], &[0x55, 0xaa], "the MBR signature");
+        let header = gpt::parse_header(&disk[512..1024]).expect("the primary checks");
+        let entries = gpt::parse_entries(&header, &disk[1024..34 * 512]).expect("its array");
+        assert_eq!(entries[0].name, "spl");
+        assert_eq!(entries[0].type_guid, gpt::JH7110_SPL);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Authoring over a disk with no fix-up writes none. The two words stay zero,
+    /// as the specification reserves them, and the plan states nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authoring_a_gpt_over_a_disk_with_no_fixup_adds_none() {
+        let (path, mut agent) = a_block_agent("fixup-none", FIXUP_DISK_SECTORS);
+
+        let plan = pollster::block_on(plan_author_gpt(&mut agent, &a_jh7110_layout(), None))
+            .expect("a plan");
+        assert_eq!(plan.boot_fixup, None);
+        assert_eq!(plan.describe_boot_fixup(), None);
+
+        pollster::block_on(write_table(
+            &mut agent,
+            plan.confirm(),
+            &mut |_| {},
+            &Cancel::new(),
+        ))
+        .expect("written and read back");
+        drop(agent);
+
+        let disk = std::fs::read(&path).expect("the disk");
+        assert_eq!(splhdr::DiskFixup::find(&disk), None);
+        assert_eq!(&disk[4..8], &[0u8; 4], "no backup address");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Repairing a damaged primary keeps the fix-up's sentinel, which lies in the
+    /// sector the repair rewrites. Sector 0, with the backup address in it, is not
+    /// written at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repairing_the_primary_keeps_the_jh7110_fixup() {
+        let mut disk = a_jh7110_disk();
+        disk[512 + 0x28] ^= 0xff; // the primary's own header CRC no longer holds
+        let (path, mut agent) = a_block_agent_holding("fixup-repair", &disk);
+
+        let plan = pollster::block_on(plan_repair_table(&mut agent, None)).expect("a plan");
+        assert_eq!(plan.segments[0].lba, gpt::HEADER_LBA);
+        assert_eq!(
+            plan.boot_fixup,
+            Some(splhdr::DiskFixup {
+                backup_offset: splhdr::DEFAULT_BOFS
+            })
+        );
+
+        pollster::block_on(write_table(
+            &mut agent,
+            plan.confirm(),
+            &mut |_| {},
+            &Cancel::new(),
+        ))
+        .expect("written and read back");
+        drop(agent);
+
+        let repaired = std::fs::read(&path).expect("the disk");
+        gpt::parse_header(&repaired[512..1024]).expect("the primary checks again");
+        assert_eq!(
+            splhdr::DiskFixup::find(&repaired),
+            splhdr::DiskFixup::find(&disk),
+            "the fix-up is where it was"
+        );
+        assert_eq!(&repaired[..512], &disk[..512], "sector 0 is not written");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A GPT header that declares itself long enough to reach the sentinel cannot
+    /// hold the fix-up as well. A repair that would rebuild one is refused at the
+    /// plan, rather than lay down a header that fails its own check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_header_reaching_the_fixup_sentinel_refuses_the_repair() {
+        let mut disk = a_jh7110_disk();
+        // The backup header claims its whole sector, with its CRC taken over it.
+        let at = ((FIXUP_DISK_SECTORS - 1) * 512) as usize;
+        let backup = &mut disk[at..at + 512];
+        backup[0x0c..0x10].copy_from_slice(&512u32.to_le_bytes());
+        backup[0x10..0x14].fill(0);
+        let crc = crc32(backup);
+        backup[0x10..0x14].copy_from_slice(&crc.to_le_bytes());
+        disk[512 + 0x28] ^= 0xff; // and the primary is damaged
+        let (path, mut agent) = a_block_agent_holding("fixup-long-header", &disk);
+
+        let error = pollster::block_on(plan_repair_table(&mut agent, None))
+            .expect_err("the header and the fix-up cannot both be kept");
+        assert!(
+            matches!(&error, Error::InvalidRequest(why) if why.contains("fix-up")),
+            "{error:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     // A firmware package small enough for a scratch file.

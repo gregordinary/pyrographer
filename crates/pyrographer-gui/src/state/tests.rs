@@ -544,7 +544,8 @@ fn a_plan_whose_named_soc_matches_the_loader_can_be_confirmed() {
 /// plan.
 ///
 /// The script answers the geometry and the loader, then the damaged primary and the
-/// intact backup that follows it.
+/// intact backup that follows it, then the disk's first two sectors, which carry no
+/// JH7110 boot ROM fix-up.
 fn scripted_repair(entries: &[Vec<u8>]) -> Vec<Step> {
     let (mut primary, _) = gpt_table(entries);
     primary[0x28] ^= 0xff; // the primary's own header CRC no longer holds
@@ -558,6 +559,7 @@ fn scripted_repair(entries: &[Vec<u8>]) -> Vec<Step> {
     steps.extend(scripted_read(4, 1, primary)); // the damaged primary, at sector 1
     steps.extend(scripted_read(5, backup_lba, backup_header)); // the backup header
     steps.extend(scripted_read(6, backup_array_lba, sector(&backup_array))); // its array
+    steps.extend(scripted_read(7, 0, vec![0u8; 1024])); // the disk's front
     steps
 }
 
@@ -649,18 +651,21 @@ fn planning_a_repair_on_a_healthy_table_fails_rather_than_waiting() {
 /// The picked layout text is carried into the job and parsed there, where the
 /// device's own sector count is in reach. This test pins that the parse runs against
 /// the board's geometry and produces a `TableAction::Author` plan, with no board and
-/// no window. Authoring then goes through the same gate a repair does.
+/// no window. A `-` partition grows to the GPT's last usable sector, short of the
+/// backup. Authoring then goes through the same gate a repair does.
 #[test]
 fn authoring_a_gpt_parses_the_layout_and_leaves_a_plan_waiting() {
     // `execute` reads the geometry to parse the layout, then `plan_author_gpt` reads
-    // the geometry and the loader again: info is two commands, chip_version one.
+    // the geometry and the loader again: info is two commands, chip_version one. It
+    // then reads the disk's first two sectors for the JH7110 boot ROM's fix-up.
     let mut steps = scripted_info(1); // execute's info: tags 1, 2
     steps.extend(scripted_info(3)); // the verb's info: tags 3, 4
     steps.extend(scripted_chip_version(5)); // the loader: tag 5
+    steps.extend(scripted_read(6, 0, vec![0u8; 1024])); // the disk's front: tag 6
 
     let mut session = a_session(steps);
     let soc = Soc::parse("rk3576").expect("pinned");
-    let source = LayoutSource::Native("data 2048 1024\n".to_string());
+    let source = LayoutSource::Native("data 2048 -\n".to_string());
 
     run(
         &mut session,
@@ -685,10 +690,15 @@ fn authoring_a_gpt_parses_the_layout_and_leaves_a_plan_waiting() {
         "it authors rather than repairs: {:?}",
         plan.action
     );
-    assert!(
-        plan.partitions.iter().any(|part| part.name == "data"),
-        "the layout's partition is in the planned table: {:?}",
-        plan.partitions
+    let data = plan
+        .partitions
+        .iter()
+        .find(|part| part.name == "data")
+        .expect("the layout's partition is in the planned table");
+    assert_eq!(
+        data.end_lba(),
+        pyrographer_core::codec::gpt::grow_end(FLASH_SECTORS, 512).expect("room for a table"),
+        "it grows to the last usable sector"
     );
 }
 

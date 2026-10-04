@@ -160,7 +160,8 @@ name first_lba sectors [type] [uuid=<GUID>]
 ```
 
 Numbers are hex or decimal. A `-` in place of `sectors` grows the partition to the end of the
-device, and `#` starts a comment. Both commands also read a board's own `mtdparts=` line from a
+device. For `author-gpt` it stops at the last sector before the backup GPT. `#` starts a
+comment. Both commands also read a board's own `mtdparts=` line from a
 file given with `--mtdparts`.
 
 A layout file, `rk3576.layout`:
@@ -183,6 +184,7 @@ partition's type comes from its type token:
 - `linux` or `data`, for Linux data
 - `esp` or `efi`, for an EFI system partition
 - `swap`, for Linux swap
+- `jh7110-spl`, for the partition a StarFive JH7110 boot ROM loads its SPL from in SD mode
 - A raw type GUID, for any other type
 
 A partition with no type token is Linux data.
@@ -212,6 +214,24 @@ each of these:
 
 Names must be unique because `--partition` aims a write by name, at a range whose end is known.
 [Addressing a partition by name](#addressing-a-partition-by-name) describes it.
+
+### The JH7110 eMMC fix-up
+
+A StarFive JH7110 boot disk carries two words in its first two sectors that the GPT does not
+own. In eMMC mode, the boot ROM reads a header from the start of the disk. A sentinel fails the
+header's check, and the ROM loads its SPL from a backup address instead. `spl_tool -i` writes
+both words: the backup address at byte `0x4`, and the sentinel `0x5A5A5A5A` at byte `0x290`.
+
+`author-gpt` writes a fresh protective MBR over the first word, and `repair-table` rewrites the
+sector that holds the second. Both commands keep the fix-up a disk already carries, and the plan
+says so on a `keeps` line. The line names the backup address and the partition it falls in:
+
+```text
+  keeps        This write keeps the JH7110 boot ROM's eMMC fix-up that the disk carries. The ROM loads its SPL from byte 0x200000, inside partition 'spl'.
+```
+
+A disk without the sentinel gets no fix-up, and its plan has no `keeps` line. A repair of the
+backup GPT writes nothing near the fix-up.
 
 ## Addressing a partition by name
 

@@ -103,6 +103,23 @@ impl Layout {
     /// and a [`Layout`] is absolute. `flash_sectors` is what a `-` size is resolved
     /// against.
     pub fn parse_mtdparts(input: &str, base_lba: u64, flash_sectors: u64) -> Result<Layout> {
+        Self::parse_mtdparts_growing_to(input, base_lba, flash_sectors, flash_sectors)
+    }
+
+    /// [`parse_mtdparts`](Self::parse_mtdparts), with a partition marked to grow
+    /// ending at `grow_end` rather than at the end of the part.
+    ///
+    /// A GPT authored from the layout passes [`gpt::grow_end`], for the reason
+    /// [`parse_native_growing_to`](Self::parse_native_growing_to) gives.
+    /// `flash_sectors` still bounds where a partition can begin.
+    ///
+    /// [`gpt::grow_end`]: crate::codec::gpt::grow_end
+    pub fn parse_mtdparts_growing_to(
+        input: &str,
+        base_lba: u64,
+        flash_sectors: u64,
+        grow_end: u64,
+    ) -> Result<Layout> {
         // Accept a whole command line, an `mtdparts=...` token, or the bare
         // `rk29xxnand:...`: find the token if it is there, else take the input as
         // the list itself.
@@ -111,16 +128,17 @@ impl Layout {
             .find_map(|token| token.strip_prefix("mtdparts="))
             .unwrap_or_else(|| input.trim());
 
-        let partitions = rkparam::parse_mtdparts(mtdparts, base_lba, flash_sectors)?
-            .into_iter()
-            .map(|part| LayoutPartition {
-                name: part.name,
-                first_lba: part.first_lba,
-                sectors: part.sectors,
-                kind: None,
-                unique_guid: None,
-            })
-            .collect();
+        let partitions =
+            rkparam::parse_mtdparts_growing_to(mtdparts, base_lba, flash_sectors, grow_end)?
+                .into_iter()
+                .map(|part| LayoutPartition {
+                    name: part.name,
+                    first_lba: part.first_lba,
+                    sectors: part.sectors,
+                    kind: None,
+                    unique_guid: None,
+                })
+                .collect();
 
         // An `mtdparts` line expresses neither partition types nor GUIDs, so an
         // authored GPT from one gets the default type and synthesized GUIDs. A
@@ -157,6 +175,27 @@ impl Layout {
     /// deterministically as the table is authored, and the parameter format ignores
     /// all three.
     pub fn parse_native(text: &str, flash_sectors: u64) -> Result<Layout> {
+        Self::parse_native_growing_to(text, flash_sectors, flash_sectors)
+    }
+
+    /// [`parse_native`](Self::parse_native), with a partition marked to grow ending
+    /// at `grow_end` rather than at the end of the part.
+    ///
+    /// A GPT keeps its backup in the last sectors of the part. A partition marked
+    /// to grow therefore ends at the GPT's last usable sector, and a GPT authored
+    /// from the layout passes [`gpt::grow_end`] here. A parameter block keeps
+    /// nothing at the end of the part, and grows to it with [`parse_native`].
+    /// `flash_sectors` still bounds where a partition can begin. A partition marked
+    /// to grow that begins at or past `grow_end` has nothing to grow into, and is
+    /// refused.
+    ///
+    /// [`gpt::grow_end`]: crate::codec::gpt::grow_end
+    /// [`parse_native`]: Self::parse_native
+    pub fn parse_native_growing_to(
+        text: &str,
+        flash_sectors: u64,
+        grow_end: u64,
+    ) -> Result<Layout> {
         let mut partitions = Vec::new();
         let mut disk_guid: Option<String> = None;
 
@@ -232,9 +271,17 @@ impl Layout {
             }
 
             let sectors = if size == "-" {
-                // Grow to the end of the part. `first_lba < flash_sectors` above
-                // makes this a positive count.
-                flash_sectors - first_lba
+                // Grow to `grow_end`. A partition that begins at or past it has
+                // nothing to grow into.
+                grow_end
+                    .checked_sub(first_lba)
+                    .filter(|&sectors| sectors > 0)
+                    .ok_or_else(|| {
+                        Error::InvalidRequest(format!(
+                            "layout line {lineno}: '{name}' grows to fill the part from sector \
+                             {first_lba}, and the part ends at sector {grow_end}"
+                        ))
+                    })?
             } else {
                 let sectors = number(size, lineno)?;
                 if sectors == 0 {
@@ -580,6 +627,54 @@ mod tests {
         assert_eq!(
             names_and_ranges(&from_mtdparts),
             names_and_ranges(&from_native)
+        );
+    }
+
+    /// A layout read for a GPT grows its `-` partition to the GPT's last usable
+    /// sector, in both formats. The table authored from it is accepted, where the
+    /// same layout grown to the last sector runs into the backup and is refused.
+    #[test]
+    fn a_growing_partition_stops_where_a_gpt_backup_begins() {
+        use crate::codec::gpt;
+        let grow_end = gpt::grow_end(FLASH_SECTORS, 512).expect("room for a table");
+        assert_eq!(grow_end, FLASH_SECTORS - 33, "the backup array and header");
+
+        let native = Layout::parse_native_growing_to(
+            "boot 0x4000 0x2000\nrootfs 0x8000 -\n",
+            FLASH_SECTORS,
+            grow_end,
+        )
+        .expect("a well-formed layout");
+        let mtdparts = Layout::parse_mtdparts_growing_to(
+            "rk29xxnand:0x2000@0x4000(boot),-@0x8000(rootfs)",
+            0,
+            FLASH_SECTORS,
+            grow_end,
+        )
+        .expect("a well-formed mtdparts line");
+        for layout in [&native, &mtdparts] {
+            let rootfs = &layout.partitions[1];
+            assert_eq!(rootfs.first_lba + rootfs.sectors, grow_end);
+            crate::verbs::author_gpt(layout, FLASH_SECTORS, 512).expect("a GPT fits it");
+        }
+
+        let to_the_end =
+            Layout::parse_native("boot 0x4000 0x2000\nrootfs 0x8000 -\n", FLASH_SECTORS).unwrap();
+        assert!(
+            crate::verbs::author_gpt(&to_the_end, FLASH_SECTORS, 512).is_err(),
+            "grown to the last sector, it overlaps the backup"
+        );
+    }
+
+    /// A partition marked to grow that begins at or past the end it grows to has
+    /// nothing to grow into, and is refused with its line.
+    #[test]
+    fn a_growing_partition_with_nothing_to_grow_into_is_refused() {
+        let error = Layout::parse_native_growing_to("rootfs 0x1000 -\n", FLASH_SECTORS, 0x1000)
+            .expect_err("it begins where the growth ends");
+        assert!(
+            matches!(&error, Error::InvalidRequest(why) if why.contains("line 1")),
+            "{error:?}"
         );
     }
 

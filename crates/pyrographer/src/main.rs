@@ -365,10 +365,13 @@ text, keeping FIRMWARE_VER and the rest.
 
 author-gpt writes a fresh GPT from the same native or mtdparts layout: a
 protective MBR, a primary, and a backup at the end of the device. Each
-partition's type comes from its type token (esp, linux, swap, or a raw type
-GUID), and the default is Linux data. The disk GUID and each unique GUID are
+partition's type comes from its type token (esp, linux, swap, jh7110-spl, or a
+raw type GUID), and the default is Linux data. A `-` size grows a partition to
+the last sector before the backup GPT. The disk GUID and each unique GUID are
 synthesized, so authoring the same layout twice yields the same table. To pin a
-specific GUID, add a `disk-guid` line or a `uuid=` attribute to the layout.
+specific GUID, add a `disk-guid` line or a `uuid=` attribute to the layout. On a
+StarFive JH7110 boot disk, author-gpt and repair-table keep the boot ROM's eMMC
+fix-up, and the plan says so.
 
 A write names its target in one of two ways, and they are not equally safe. An
 <lba> is a number you supply. --partition names a partition in the device's own
@@ -1959,7 +1962,8 @@ fn render_partition_lines(partitions: &[Partition]) -> Vec<String> {
 ///
 /// It also shows what is particular to a table write. That is whether it repairs
 /// or authors, the segments it lays down and where, and the partitions the
-/// resulting table holds. A person recognizes the table by its partitions.
+/// resulting table holds. A person recognizes the table by its partitions. Where
+/// the disk carries the JH7110 boot ROM's eMMC fix-up, it says the write keeps it.
 fn render_segmented_plan(device: &Chosen, plan: &SegmentedPlan) -> String {
     let sector_size = u64::from(plan.flash.sector_size);
     let format = plan.format.name();
@@ -1992,10 +1996,15 @@ fn render_segmented_plan(device: &Chosen, plan: &SegmentedPlan) -> String {
         })
         .collect();
 
+    let keeps = plan
+        .describe_boot_fixup()
+        .map(|said| render_column("keeps", &[said]))
+        .unwrap_or_default();
+
     format!(
         "\n\
          This will {verb} the {format} table on {}{head_end}\n\
-         {}{}  \
+         {}{}{keeps}  \
          {:<12} {} ({} sectors of {sector_size} bytes)\n\
          {}\
          \n\
@@ -2268,10 +2277,16 @@ fn cmd_author_gpt(mut args: pico_args::Arguments) -> Run {
 
         // A GPT is absolute, so an mtdparts line is resolved at base zero: its offsets
         // are the sectors a GPT addresses from, with no eMMC reserved-region base a
-        // parameter would count from.
+        // parameter would count from. A growing partition stops short of the backup.
+        let grow_end =
+            pyrographer_core::codec::gpt::grow_end(flash_sectors, flash.sector_size as usize)?;
         let layout = match &source {
-            GptSource::Layout(path) => Layout::parse_native(&read(path)?, flash_sectors)?,
-            GptSource::Mtdparts(path) => Layout::parse_mtdparts(&read(path)?, 0, flash_sectors)?,
+            GptSource::Layout(path) => {
+                Layout::parse_native_growing_to(&read(path)?, flash_sectors, grow_end)?
+            }
+            GptSource::Mtdparts(path) => {
+                Layout::parse_mtdparts_growing_to(&read(path)?, 0, flash_sectors, grow_end)?
+            }
         };
 
         let plan = verbs::plan_author_gpt(&mut agent, &layout, soc).await?;
@@ -5796,6 +5811,7 @@ mod tests {
                 bytes: vec![0u8; 1024],
                 touches: Touches::Partitions(Vec::new()),
             }],
+            boot_fixup: None,
         };
 
         let rendered = render_segmented_plan(&a_chosen_board(), &plan);
@@ -5843,6 +5859,28 @@ mod tests {
         assert!(
             rendered.contains("Nothing here can be undone"),
             "what it costs to be wrong: {rendered}"
+        );
+        assert!(
+            !rendered.contains("keeps"),
+            "a disk with no fix-up has nothing kept to state: {rendered}"
+        );
+
+        // The same repair over a disk carrying the JH7110 boot ROM's fix-up says
+        // it keeps it, in core's words, and where the ROM will look.
+        let plan = SegmentedPlan {
+            boot_fixup: Some(pyrographer_core::codec::splhdr::DiskFixup {
+                backup_offset: 0x20_0000,
+            }),
+            ..plan
+        };
+        let rendered = render_segmented_plan(&a_chosen_board(), &plan);
+        assert!(
+            rendered.contains("keeps") && rendered.contains("eMMC fix-up"),
+            "the fix-up kept: {rendered}"
+        );
+        assert!(
+            rendered.contains("byte 0x200000, outside every partition"),
+            "where the ROM loads its SPL: {rendered}"
         );
     }
 

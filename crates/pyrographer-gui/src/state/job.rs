@@ -26,6 +26,7 @@ use pyrographer_core::agent::{FlashAgent, FlashInfo, ReadBack};
 use pyrographer_core::bootstrap::ingenic::IngenicLoader;
 use pyrographer_core::bootstrap::starfive;
 use pyrographer_core::codec::console as console_codec;
+use pyrographer_core::codec::gpt;
 use pyrographer_core::codec::ingenic_boot::CpuInfo;
 use pyrographer_core::codec::rkboot::LoaderImage;
 use pyrographer_core::codec::rockusb::{Capability, ResetMode, StorageMedium};
@@ -1004,10 +1005,16 @@ async fn execute<T: Transport>(
         Task::PlanAuthorGpt { source, soc } => {
             let flash = target.info().await?;
             let flash_sectors = flash_sectors(&flash);
+            // A growing partition stops short of the backup at the end of the part.
+            let grow_end = gpt::grow_end(flash_sectors, flash.sector_size as usize)?;
             let layout = match &source {
-                LayoutSource::Native(text) => Layout::parse_native(text, flash_sectors)?,
+                LayoutSource::Native(text) => {
+                    Layout::parse_native_growing_to(text, flash_sectors, grow_end)?
+                }
                 // A GPT is absolute, so mtdparts offsets count from zero.
-                LayoutSource::Mtdparts(text) => Layout::parse_mtdparts(text, 0, flash_sectors)?,
+                LayoutSource::Mtdparts(text) => {
+                    Layout::parse_mtdparts_growing_to(text, 0, flash_sectors, grow_end)?
+                }
                 LayoutSource::Text(_) => {
                     return Err(Error::InvalidRequest(
                         "a GPT is authored from a partition layout, not from parameter text"

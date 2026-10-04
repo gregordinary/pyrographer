@@ -4564,7 +4564,8 @@ fn clone_plan(app: &App, plan: &ClonePlan, ui: &mut egui::Ui) {
 /// recognizes the table by those partitions.
 ///
 /// Every copy being written is colored for danger. A repair leaves the intact copy
-/// it rebuilds from untouched, and says so.
+/// it rebuilds from untouched, and says so. Where the disk carries the JH7110 boot
+/// ROM's eMMC fix-up, a row says the write keeps it.
 fn table_plan(app: &App, plan: &SegmentedPlan, ui: &mut egui::Ui) {
     let sector_size = u64::from(plan.flash.sector_size);
     let (seg_label, act) = match &plan.action {
@@ -4612,6 +4613,12 @@ fn table_plan(app: &App, plan: &SegmentedPlan, ui: &mut egui::Ui) {
             ui.label("partitions");
             partition_list(&plan.partitions, ui);
             ui.end_row();
+
+            if let Some(said) = plan.describe_boot_fixup() {
+                ui.label("keeps");
+                ui.label(said);
+                ui.end_row();
+            }
 
             ui.label("flash");
             ui.monospace(geometry(&plan.flash));
@@ -6064,6 +6071,7 @@ mod tests {
                 bytes: vec![0u8; 16896],
                 touches: Touches::Partitions(Vec::new()),
             }],
+            boot_fixup: None,
         }
     }
 
@@ -7216,6 +7224,32 @@ mod tests {
         assert!(
             words.contains("checked") && words.contains("stops the write at that window"),
             "a table write: {words}"
+        );
+    }
+
+    /// A table write over a disk carrying the JH7110 boot ROM's eMMC fix-up says
+    /// it keeps it, in core's words. A plan with no fix-up draws no such row.
+    #[test]
+    fn a_table_plan_states_the_boot_fixup_it_keeps() {
+        let app = an_app();
+
+        let words = drawn(|ui| table_plan(&app, &a_repair_plan(), ui));
+        assert!(!words.contains("keeps"), "nothing kept: {words}");
+
+        let plan = SegmentedPlan {
+            boot_fixup: Some(pyrographer_core::codec::splhdr::DiskFixup {
+                backup_offset: 0x20_0000,
+            }),
+            ..a_repair_plan()
+        };
+        let words = drawn(|ui| table_plan(&app, &plan, ui));
+        assert!(
+            words.contains("keeps") && words.contains("eMMC fix-up"),
+            "the fix-up kept: {words}"
+        );
+        assert!(
+            words.contains("byte 0x200000"),
+            "where the ROM loads its SPL: {words}"
         );
     }
 

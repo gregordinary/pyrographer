@@ -37,7 +37,8 @@
 //! always holds the body's true CRC. The `0x5A5A5A5A` that `spl_tool -i` writes
 //! belongs to a whole **disk image**, at disk offset `0x290`, in sector 1 past the
 //! GPT header. It makes the ROM in eMMC mode fall through to the backup address at
-//! disk offset `0x4`. No SPL carries it. **\[DOC\]**
+//! disk offset `0x4`. No SPL carries it. [`DiskFixup`] reads and writes those two
+//! words. **\[DOC\]**
 //!
 //! # The checksum
 //!
@@ -92,6 +93,87 @@ const OFF_VERS: usize = 0x284;
 const OFF_FSIZ: usize = 0x288;
 const OFF_RES1: usize = 0x28C;
 const OFF_CRCS: usize = 0x290;
+
+/// The word `spl_tool -i` writes at a disk's `crcs` offset, which its source names
+/// `CRCFAILED`.
+pub const DISK_SENTINEL: u32 = 0x5A5A_5A5A;
+
+/// The JH7110 boot ROM's eMMC fix-up, as a disk carries it.
+///
+/// In eMMC mode, the ROM reads a header from the first [`HEADER_LEN`] bytes of the
+/// disk. On a GPT disk, those bytes are the protective MBR and the GPT header.
+/// `spl_tool -i` writes two words into them, at the header's own field offsets:
+///
+/// - The backup address, at disk offset `0x4`, in the protective MBR's boot-code
+///   area
+/// - [`DISK_SENTINEL`], at disk offset `0x290`, in sector 1 past the 92-byte GPT
+///   header
+///
+/// The ROM's check fails on the sentinel, and the ROM loads its SPL from the backup
+/// address. Neither word lies in a byte a GPT checksum covers, so the table stays
+/// valid. A table writer that rewrites the protective MBR whole, or zero-fills
+/// sector 1 past the header, erases both words. **\[DOC\]**
+///
+/// [`plan_author_gpt`] and [`plan_repair_table`] read the fix-up with
+/// [`find`](Self::find), and carry it into the bytes they write with
+/// [`apply`](Self::apply).
+///
+/// [`plan_author_gpt`]: crate::verbs::plan_author_gpt
+/// [`plan_repair_table`]: crate::verbs::plan_repair_table
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskFixup {
+    /// The byte offset on the disk that the ROM loads its SPL from. It is the word
+    /// at disk offset `0x4`.
+    pub backup_offset: u32,
+}
+
+impl DiskFixup {
+    /// The disk offset of the sentinel: the header's `crcs` offset.
+    pub const SENTINEL_AT: usize = OFF_CRCS;
+
+    /// How many bytes from the start of a disk [`find`](Self::find) reads. The
+    /// sentinel is the last word it covers.
+    pub const SPAN: usize = Self::SENTINEL_AT + 4;
+
+    /// Find the fix-up in `front`, the first bytes of a disk.
+    ///
+    /// The sentinel identifies it. The GPT specification reserves the bytes it
+    /// occupies as zero, so a disk holds the sentinel there only where the fix-up
+    /// put it. The backup address is read as the disk carries it, whatever its
+    /// value. A `front` shorter than [`SPAN`](Self::SPAN) bytes holds no fix-up.
+    pub fn find(front: &[u8]) -> Option<DiskFixup> {
+        if front.len() < Self::SPAN || read_u32(front, OFF_CRCS) != DISK_SENTINEL {
+            return None;
+        }
+        Some(DiskFixup {
+            backup_offset: read_u32(front, OFF_BOFS),
+        })
+    }
+
+    /// Write the fix-up into `run`, the bytes a write lays down from disk byte `at`.
+    ///
+    /// Each byte of the two words that falls inside the run is written. The rest of
+    /// the run is left as it is. It returns whether any byte fell inside. A run
+    /// that begins past the sentinel holds neither word.
+    pub fn apply(&self, at: u64, run: &mut [u8]) -> bool {
+        let words = [(OFF_BOFS, self.backup_offset), (OFF_CRCS, DISK_SENTINEL)];
+        let mut wrote = false;
+        for (offset, value) in words {
+            for (byte_at, byte) in (offset..).zip(value.to_le_bytes()) {
+                // A disk byte before the run's start has no place in it. Past that,
+                // the index is below SPAN, so the cast is lossless on every target.
+                let Some(index) = (byte_at as u64).checked_sub(at) else {
+                    continue;
+                };
+                if let Some(slot) = run.get_mut(index as usize) {
+                    *slot = byte;
+                    wrote = true;
+                }
+            }
+        }
+        wrote
+    }
+}
 
 /// The header fields, parsed from a `.normal.out`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +474,91 @@ mod tests {
         let header = check(&image).unwrap();
         assert_eq!(header.fsiz, 0);
         assert_eq!(header.crcs, crc32(&[]));
+    }
+
+    /// The first two sectors of a GPT disk: an authored table's protective MBR and
+    /// primary header.
+    fn a_gpt_disk_front() -> Vec<u8> {
+        use crate::codec::gpt;
+        let spl = gpt::AuthoredPartition {
+            name: "spl".to_string(),
+            first_lba: 4096,
+            sectors: 4096,
+            type_guid: gpt::JH7110_SPL,
+            unique_guid: gpt::derive_guid(1, b"spl"),
+        };
+        let table = gpt::author(&[spl], gpt::derive_guid(0, b"disk"), 1 << 20, 512)
+            .expect("a well-formed table");
+        table.primary.bytes[..HEADER_LEN].to_vec()
+    }
+
+    /// `apply` over the front of a GPT disk changes exactly the two words
+    /// `spl_tool -i` changes, and nothing else. The GPT header still passes its
+    /// checks afterward, because neither word lies in a byte its CRC covers.
+    #[test]
+    fn the_disk_fixup_lands_where_spl_tool_puts_it_and_leaves_the_gpt_valid() {
+        let front = a_gpt_disk_front();
+        let mut fixed = front.clone();
+        let fixup = DiskFixup {
+            backup_offset: DEFAULT_BOFS,
+        };
+        assert!(fixup.apply(0, &mut fixed), "both words fall in the run");
+
+        // What spl_tool's img_fixed_hdr does to the same 1024 bytes.
+        let mut by_spl_tool = front.clone();
+        write_u32(&mut by_spl_tool, OFF_BOFS, DEFAULT_BOFS);
+        write_u32(&mut by_spl_tool, OFF_CRCS, DISK_SENTINEL);
+        assert_eq!(fixed, by_spl_tool);
+
+        let header = crate::codec::gpt::parse_header(&fixed[512..1024])
+            .expect("the GPT header still checks");
+        assert_eq!(header.current_lba, 1);
+        assert_eq!(
+            &fixed[510..512],
+            &[0x55, 0xaa],
+            "the MBR keeps its signature"
+        );
+    }
+
+    /// The sentinel identifies the fix-up, and the backup address comes back as
+    /// the disk carries it. A front without the sentinel, or too short to reach
+    /// it, holds no fix-up.
+    #[test]
+    fn the_disk_fixup_is_found_by_its_sentinel() {
+        let mut front = a_gpt_disk_front();
+        assert_eq!(DiskFixup::find(&front), None, "a plain GPT disk");
+
+        DiskFixup {
+            backup_offset: 0x10_0000,
+        }
+        .apply(0, &mut front);
+        assert_eq!(
+            DiskFixup::find(&front),
+            Some(DiskFixup {
+                backup_offset: 0x10_0000
+            })
+        );
+        assert_eq!(DiskFixup::find(&front[..DiskFixup::SPAN - 1]), None);
+    }
+
+    /// A run that starts at sector 1, as a repaired primary does, takes only the
+    /// sentinel. The backup address lies in sector 0, outside the run. A run that
+    /// starts past the sentinel takes nothing and is left as it was.
+    #[test]
+    fn a_run_takes_only_the_fixup_bytes_inside_it() {
+        let fixup = DiskFixup {
+            backup_offset: DEFAULT_BOFS,
+        };
+
+        let mut sector_one = vec![0u8; 512];
+        assert!(fixup.apply(512, &mut sector_one));
+        let mut expected = vec![0u8; 512];
+        write_u32(&mut expected, OFF_CRCS - 512, DISK_SENTINEL);
+        assert_eq!(sector_one, expected);
+
+        let mut sector_two = vec![0xa5u8; 512];
+        assert!(!fixup.apply(1024, &mut sector_two));
+        assert!(sector_two.iter().all(|&b| b == 0xa5));
     }
 
     /// The four StarFive binaries, as they ship.
