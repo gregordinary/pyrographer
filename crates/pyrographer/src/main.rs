@@ -4395,8 +4395,9 @@ fn is_returned_board(
 /// presents the same vendor interface and bulk pair a loader does, with nothing
 /// serving the endpoints. Claiming the interface therefore succeeds on both. One
 /// probe command settles it: a loader answers `TEST_UNIT_READY`, and a BootROM's
-/// dead endpoints fault. A board that fails the probe is refused as maskrom, and
-/// the hint names the upload that changes that.
+/// dead endpoints fault. A board that brings no answer back is refused as maskrom,
+/// and the hint names the upload that changes that. A board whose answer is refused
+/// is a loader, and that refusal is the error reported.
 ///
 /// Mass storage is the one Rockchip mode the descriptors name reliably, because
 /// the class is in the interface descriptor. It is refused without an open,
@@ -4411,9 +4412,9 @@ async fn open_loader(device: &DeviceInfo) -> Result<FlashAgent<UsbTransport>> {
 /// Open a Rockchip device and probe it for a loader.
 ///
 /// It is the Rockchip half of [`open_loader`]. The bcdUSB mode flag is a claim,
-/// so a maskrom-flagged board is opened and sent a `TEST_UNIT_READY` before it is
-/// trusted. Only mass storage, which the interface class names reliably, is
-/// refused without an open.
+/// so a maskrom-flagged board is opened and probed with
+/// [`RockusbAgent::probe_loader`] before it is trusted. Only mass storage, which
+/// the interface class names reliably, is refused without an open.
 async fn open_rockchip_loader(device: &DeviceInfo) -> Result<FlashAgent<UsbTransport>> {
     if device.mode == Mode::MassStorage {
         return Err(Error::WrongMode {
@@ -4423,7 +4424,7 @@ async fn open_rockchip_loader(device: &DeviceInfo) -> Result<FlashAgent<UsbTrans
     }
     let transport = UsbTransport::open(device).await?;
     let mut agent = RockusbAgent::new(transport);
-    if device.mode == Mode::Maskrom && agent.test_unit_ready().await.is_err() {
+    if device.mode == Mode::Maskrom && !agent.probe_loader().await? {
         return Err(Error::WrongMode {
             found: "maskrom",
             needed: "loader",
@@ -5026,8 +5027,8 @@ mod tests {
             .expect("a pinned SoC parses");
         assert_eq!(args.soc.map(|soc| soc.name()), Some("rk3576"));
 
-        let error = parse_flash(&mut arguments(&["--soc", "rk3588", "64", "boot.img"]))
-            .expect_err("no board has pinned rk3588");
+        let error = parse_flash(&mut arguments(&["--soc", "rk3399", "64", "boot.img"]))
+            .expect_err("no board has pinned rk3399");
         let message = format!("{error}");
         assert!(message.contains("rk3576"), "{message}");
         assert!(
@@ -5687,8 +5688,8 @@ mod tests {
         assert!(!args.dry_run);
         assert_eq!(args.device, None);
 
-        let error = parse_repair_table(&mut arguments(&["--soc", "rk3588"]))
-            .expect_err("no board has pinned rk3588");
+        let error = parse_repair_table(&mut arguments(&["--soc", "rk3399"]))
+            .expect_err("no board has pinned rk3399");
         assert!(matches!(error, CliError::Usage(_)), "{error:?}");
     }
 

@@ -2,10 +2,11 @@
 
 > [!WARNING]
 > pyrographer is under active development, and many of its features are untested on real
-> hardware. No write to a board has run on hardware yet. A write that goes wrong can leave a
-> board unable to boot, or destroy the data on a disk. Use pyrographer at your own risk, and
-> only on a device you can afford to lose. Here and in the book, `[UNVERIFIED]` marks a feature
-> that passes its tests against scripted devices and has not yet run on a real one.
+> hardware. Writing has run on one board so far, a raw image flashed to an RK3588S. A write that
+> goes wrong can leave a board unable to boot, or destroy the data on a disk. Use pyrographer at
+> your own risk, and only on a device you can afford to lose. Here and in the book,
+> `[UNVERIFIED]` marks a feature that passes its tests against scripted devices and has not yet
+> run on a real one.
 
 pyrographer is a flashing and recovery toolkit for embedded devices, such as single-board
 computers and IP cameras, written entirely in safe Rust. It comprises a command-line tool, a
@@ -26,7 +27,7 @@ presents a plan of the changes and proceeds only on explicit confirmation.
 pyrographer supports three SoC families, and block devices on Linux:
 
 - **Rockchip**, over USB. Reading is verified on a real RK3576, byte for byte against
-  rkdeveloptool, Rockchip's own tool.
+  rkdeveloptool, Rockchip's own tool. Reading and writing are verified on a real RK3588S.
 - **StarFive JH7110**, over serial. pyrographer writes the boot flash through the SoC's UART
   recovery mode. That mode cannot read flash, so the write is not read back. pyrographer can also
   boot U-Boot in RAM over the same line, which hands the eMMC to the block-device commands.
@@ -44,8 +45,9 @@ page lists what has run on which board.
 ## Commands
 
 The four core operations run on Rockchip boards and on block devices. An Ingenic device in DFU
-supports `dump` and `verify`. `list`, `info` and `partitions` find a device and describe it. `--partition <name>` aims `dump`,
-`flash` and `verify` at a partition by name, and refuses an image too large for it.
+supports `dump` and `verify`. `list`, `info` and `partitions` find a device and describe it.
+`--partition <name>` aims `dump`, `flash` and `verify` at a partition by name, and refuses an
+image too large for it.
 
 `--device` selects a board by `<bus>:<address>`, or a disk by its node path, such as
 `/dev/sdb`. pyrographer never selects a disk by default, and `list` shows disks only with
@@ -75,7 +77,7 @@ Two commands work with a board's bootloader prompt over a serial line:
 - `uboot` drives a U-Boot prompt. It can present the board's storage over USB, boot from
   another source once, or send a single command.
 
-`chipver`, `storage` and `reset` query or reset a running Rockchip loader. The
+`chipver`, `capability`, `storage` and `reset` query or reset a running Rockchip loader. The
 [command-line reference](https://gregordinary.github.io/pyrographer/reference/cli/index.html)
 documents every command and option.
 

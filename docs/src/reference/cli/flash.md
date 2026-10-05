@@ -184,7 +184,7 @@ built for one SoC, but runs on whatever board it was uploaded to. The wrong load
 wrong offsets, and returns a plausible status for every command.
 
 The comparison is exact: the whole reply must equal, byte for byte, the reply a real board of
-that SoC gave. Nothing is decoded or guessed. `rk3576` is the only SoC pinned.
+that SoC gave. Nothing is decoded or guessed. `rk3576` and `rk3588` are pinned.
 
 The gate refuses in three cases, each before anything is written. The first is a write with no
 SoC named:

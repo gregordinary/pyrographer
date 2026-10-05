@@ -4,8 +4,9 @@ This page lists what has run against real hardware, and on which board. Everythi
 built and tested against a scripted device, which replays the bytes a real device sends. The
 reference pages carry the same evidence tags beside each command they describe.
 
-Every board result here comes from one board, the H96 Max M9, an RK3576 TV box.
-[Rockchip RK3576](../boards/rk3576.md) holds what is measured on it.
+The board results here come from two Rockchip boards. The H96 Max M9 is an RK3576 TV box, and
+the NanoPi R6S is an RK3588S router board. [Rockchip RK3576](../boards/rk3576.md) and
+[Rockchip RK3588](../boards/rk3588.md) hold what is measured on each.
 
 ## Evidence tags
 
@@ -22,28 +23,31 @@ weaker claim carries one of these tags:
 
 ## Rockchip
 
-| Command | On hardware |
-|---|---|
-| `list` | Measured. The mode probe tells the BootROM from a loader. |
-| `info` | Measured. It agrees with rkdeveloptool field for field. |
-| `chipver` | Measured. The reply is pinned as `rk3576`. |
-| `capability`, `storage` | `[UNVERIFIED]` |
-| `partitions` | Measured. It reads the board's 16-partition GPT. |
-| `dump` | Measured. A 4 MiB dump is byte-identical to rkdeveloptool's. |
-| `db --loader` | Measured, with rkbin's SPL loader and with a mainline U-Boot container. |
-| `db --code471 --code472` | `[UNVERIFIED]` |
-| `reset` | Measured in the default mode. The other three modes are `[COMMUNITY]`. |
-| `flash`, `verify`, `clone` | `[UNVERIFIED]`. No write to a board has run. |
-| `repair-table`, `repair-param`, `author-gpt`, `author-param` | `[UNVERIFIED]` |
-| `write-idb`, `flash-firmware` | `[UNVERIFIED]`. The ID block layout is measured from rkbin's loader. |
-| `firmware-info` | `[UNVERIFIED]`. No package from a vendor build has been read. |
+| Command | RK3576, H96 Max M9 | RK3588S, NanoPi R6S |
+|---|---|---|
+| `list` | Measured. The mode probe tells the BootROM from a loader. | Measured. The mode probe finds the loader. |
+| `info` | Measured. It agrees with rkdeveloptool field for field. | Measured |
+| `chipver` | Measured. The reply is pinned as `rk3576`. | Measured. The reply is pinned as `rk3588`. |
+| `capability`, `storage` | `[UNVERIFIED]` | Measured |
+| `partitions` | Measured. It reads the board's 16-partition GPT. | Measured |
+| `dump` | Measured. A 4 MiB dump is byte-identical to rkdeveloptool's. | Measured. Three ranges are byte-identical to a raw read. |
+| `db --loader` | Measured, with rkbin's SPL loader and with a mainline U-Boot container. | Measured, with FriendlyELEC's `MiniLoaderAll.bin` |
+| `db --code471 --code472` | `[UNVERIFIED]` | `[UNVERIFIED]` |
+| `reset` | Measured in the default mode. The other three modes are `[COMMUNITY]`. | Measured in the default mode |
+| `flash`, `verify` | `[UNVERIFIED]`. No write to this board has run. | Measured. A 168 MiB image is written and read back, then verified through a fresh open. |
+| `clone` | `[UNVERIFIED]` | `[UNVERIFIED]` |
+| `repair-table`, `repair-param`, `author-gpt`, `author-param` | `[UNVERIFIED]` | `[UNVERIFIED]` |
+| `write-idb`, `flash-firmware` | `[UNVERIFIED]`. The ID block layout is measured from rkbin's loader. | `[UNVERIFIED]` |
+| `firmware-info` | `[UNVERIFIED]`. No package from a vendor build has been read. | `[UNVERIFIED]` |
 
-The wrong-loader gate is armed for `rk3576` alone, so a write to any other Rockchip SoC is
-refused. Erasing is refused. The erase opcode is published by Rockchip `[DOC]`, but no board has
+The wrong-loader gate is armed for `rk3576` and `rk3588`, so a write to any other Rockchip SoC is
+refused. The RK3588S write followed
+[Flashing a disk image from maskrom](../guides/maskrom-flash.md). Erasing is refused. The erase opcode is published by Rockchip `[DOC]`, but no board has
 confirmed what the command does to a range.
 
 Through rkbin's SPL loader, the H96 Max M9 answers every read past its first 32 MiB with constant
 fill. [The 32 MiB read wall](../boards/rk3576.md#the-32-mib-read-wall) says how to read the rest.
+The NanoPi R6S reads to the last sector of its eMMC.
 
 ## Mainline U-Boot on a Rockchip board
 

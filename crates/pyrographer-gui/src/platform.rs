@@ -411,9 +411,10 @@ mod native {
     /// flag is only a claim. The RK3576 SPL loader runs rockusb behind the even
     /// flag of the maskrom it replaced. The BootROM presents the same vendor
     /// interface and bulk pair, with nothing serving the endpoints. A
-    /// maskrom-flagged board is therefore opened and sent `TEST_UNIT_READY`. Only
-    /// mass storage, which the interface class names reliably, is refused without
-    /// an open.
+    /// maskrom-flagged board is therefore opened and probed with
+    /// [`RockusbAgent::probe_loader`], which calls it maskrom only when nothing
+    /// answers. Only mass storage, which the interface class names reliably, is
+    /// refused without an open.
     ///
     /// An Ingenic board's flash is reachable over DFU once a DFU-capable U-Boot runs
     /// on it. Only a board already in DFU mode is opened here. The open is
@@ -432,7 +433,7 @@ mod native {
                 }
                 let transport = UsbTransport::open(device).await?;
                 let mut agent = RockusbAgent::new(transport);
-                if device.mode == Mode::Maskrom && agent.test_unit_ready().await.is_err() {
+                if device.mode == Mode::Maskrom && !agent.probe_loader().await? {
                     return Err(Error::WrongMode {
                         found: "maskrom",
                         needed: "loader",
@@ -865,8 +866,8 @@ mod web {
     ///
     /// For Rockchip it probes rather than reading the flag, because the bcdUSB
     /// flag is only a claim. The RK3576 BootROM presents the same interface and
-    /// bulk pair a loader does, and one `TEST_UNIT_READY` tells them apart. Only
-    /// mass storage is refused outright.
+    /// bulk pair a loader does, and one probe, [`RockusbAgent::probe_loader`], tells
+    /// them apart. Only mass storage is refused outright.
     ///
     /// For Ingenic there is nothing to probe, because the mode is in the product
     /// ID. A DFU gadget is opened with `open_dfu`, which reads its alt-settings
@@ -885,7 +886,7 @@ mod web {
                 }
                 let transport = WebUsbTransport::open(device.clone()).await?;
                 let mut agent = RockusbAgent::new(transport);
-                if info.mode == Mode::Maskrom && agent.test_unit_ready().await.is_err() {
+                if info.mode == Mode::Maskrom && !agent.probe_loader().await? {
                     return Err(Error::WrongMode {
                         found: "maskrom",
                         needed: "loader",

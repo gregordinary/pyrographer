@@ -25,12 +25,15 @@ any Rockchip SoC in device mode, including a part pyrographer has no entry for.
 
 The mode column is a claim, read from the low bit of `bcdUSB`. An odd flag means a loader, and
 pyrographer trusts it. An even flag means either the BootROM or a loader that does not set the
-flag, such as the RK3576 SPL loader.
+flag. The RK3576 SPL loader and the RK3588 usbplug loader both leave it even.
 
 The device-bound commands settle an even flag by asking. They open the board and send one probe
 command, which a running loader answers. A BootROM presents the same bulk endpoints with nothing
 serving them, so it fails the probe. The command then refuses, names the mode as maskrom, and
 points to [`db`](bootstrapping.md#bringing-a-maskrom-board-to-loader-mode).
+
+A board that answers the probe is running a loader, even when pyrographer refuses the answer.
+The command then reports that refusal, and not maskrom, because an upload would not fix it.
 
 ## Choosing between boards
 
@@ -44,7 +47,7 @@ pyrographer list
 
 ```text
 2207:350e  loader        bus 003 address 12  (bcdUSB 0201)
-2207:350b  loader        bus 003 address 14  (bcdUSB 0201)
+2207:350e  loader        bus 003 address 14  (bcdUSB 0201)
 ```
 
 ```sh

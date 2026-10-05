@@ -332,6 +332,14 @@ fn addressable(lba: u64, bytes: usize, what: &str) -> Result<u32> {
 /// field it never maintained. The check therefore passes a correct device and a
 /// careless one. It fails only a device that reports having done less than it did.
 ///
+/// A residue **larger than the request** is passed for the same reason. No transfer
+/// leaves more bytes untransferred than it announced, so the field holds something
+/// other than accounting. The RK3588 usbplug loader stores the reply's length there
+/// big-endian. After a 16-byte chip-version reply it sends `00 00 00 10`, which
+/// reads here as 268435456 (measured on a NanoPi R6S). A field that carries no
+/// accounting contradicts nothing. The data phase's own length checks still stand,
+/// and a write is still proved by its read-back.
+///
 /// That reasoning covers the IN direction, where the bytes are the device's. On an
 /// OUT phase the same arithmetic catches a different failure, which is also refused.
 /// There `delivered` is what the *host* put on the wire. A shortfall means the
@@ -346,11 +354,7 @@ fn check_residue(
     delivered: u32,
 ) -> Result<()> {
     if residue > announced {
-        return Err(Error::Protocol(format!(
-            "{} reports {residue} bytes of {announced} untransferred, which is more than it was \
-             asked for",
-            opcode.name()
-        )));
+        return Ok(());
     }
 
     let claimed = announced - residue;
@@ -552,6 +556,33 @@ impl<T: Transport> RockusbAgent<T> {
         Ok(())
     }
 
+    /// Probe for a running loader, and say whether one answered.
+    ///
+    /// It sends one `TEST_UNIT_READY` and sorts the outcome three ways:
+    ///
+    /// - `Ok(true)`: the probe passed, so a loader is serving the bulk pair.
+    /// - `Ok(false)`: no status answering the probe came back. The transfer
+    ///   faulted, stalled or timed out, or what came back was not this command's
+    ///   CSW. A BootROM's unserved bulk pair behaves this way.
+    /// - `Err`: a status answering the probe came back, and it reported a failure
+    ///   or carried a reply this agent refuses. A loader is running, and the error
+    ///   is the finding.
+    ///
+    /// The bcdUSB flag cannot tell a BootROM from every loader, so a front-end opens
+    /// a maskrom-flagged board and asks this. Reporting a board that answered as
+    /// maskrom would hide the error behind the wrong remedy. After `Ok(false)` the
+    /// agent is desynchronized, as after any lost exchange.
+    pub async fn probe_loader(&mut self) -> Result<bool> {
+        match self.test_unit_ready().await {
+            Ok(()) => Ok(true),
+            // A phase error is a status that answered, even though it leaves the
+            // agent out of step.
+            Err(error @ Error::CommandFailed { .. }) => Err(error),
+            Err(_) if self.desynchronized => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Whether this agent is desynchronized from its device. See
     /// [`command`](Self::command).
     fn is_desynchronized(&self) -> bool {
@@ -600,10 +631,10 @@ impl<T: Transport> RockusbAgent<T> {
     /// not exhaustive.
     ///
     /// The bytes are returned uninterpreted, because the gate compares the whole
-    /// reply with pinned bytes and never decodes it. An RK3576's reply is pinned in
-    /// [`soc`](crate::soc). This method reads whatever length the loader sends and
-    /// returns it raw. The same bytes pin a new SoC and are what the armed gate
-    /// checks.
+    /// reply with pinned bytes and never decodes it. The replies of an RK3576 and
+    /// an RK3588 are pinned in [`soc`](crate::soc). This method reads whatever
+    /// length the loader sends and returns it raw. The same bytes pin a new SoC
+    /// and are what the armed gate checks.
     async fn chip_version(&mut self) -> Result<Vec<u8>> {
         self.command(
             Opcode::GetChipVer,
@@ -621,11 +652,11 @@ impl<T: Transport> RockusbAgent<T> {
     /// disagree: pyrographer implements the read path, but a loader that does not
     /// set [`read_lba`](rockusb::Capability::read_lba) will not serve it.
     ///
-    /// Nothing gates on this, and it deliberately does not gate the read path. No
-    /// board has answered the command. A refusal keyed on a flag nobody has seen set
-    /// would be a guess, and could turn away a working loader. The answer is only
-    /// reported. When hardware shows what a real loader answers, it can become a
-    /// precondition.
+    /// The ID-block writes gate on [`new_idb`](rockusb::Capability::new_idb). The
+    /// read path deliberately does not gate on `read_lba`. One loader has answered,
+    /// the RK3588 usbplug on a NanoPi R6S, with `3f 07` and both flags set. One
+    /// answer does not show that every working loader sets the flag, and a refusal
+    /// keyed on it could turn one away.
     async fn capability(&mut self) -> Result<rockusb::Capability> {
         let payload = self
             .command(
@@ -2128,20 +2159,117 @@ mod tests {
         );
     }
 
+    /// A residue larger than the request is not accounting, and is passed.
+    ///
+    /// No transfer leaves nine of five bytes untransferred, so the field holds
+    /// something else. The reply is the one the data phase delivered.
     #[test]
-    fn a_residue_larger_than_the_request_is_refused() {
+    fn a_residue_larger_than_the_request_is_not_accounting() {
         let transport = ScriptedTransport::new(vec![
-            cbw(1, 5, Direction::In, Opcode::ReadFlashId, 0, 0),
-            Step::Reply(vec![0x45, 0x4d, 0x4d, 0x43, 0x20]),
-            csw_passed_with_residue(1, 9),
+            cbw(1, 16, Direction::In, Opcode::GetChipVer, 0, 0),
+            Step::Reply(vec![0x36, 0x37, 0x35, 0x33]),
+            csw_passed_with_residue(1, 17),
         ]);
 
         let mut agent = FlashAgent::Rockusb(RockusbAgent::new(transport));
-        let error = pollster::block_on(agent.info()).expect_err("nine of five is nonsense");
+        let version = pollster::block_on(agent.chip_version())
+            .expect("a field that is not accounting contradicts nothing");
+        assert_eq!(version, vec![0x36, 0x37, 0x35, 0x33]);
+        assert!(!agent.is_desynchronized());
+    }
+
+    /// The residue field as the RK3588 usbplug loader fills it: the reply's length,
+    /// big-endian.
+    fn length_big_endian(length: u32) -> u32 {
+        u32::from_le_bytes(length.to_be_bytes())
+    }
+
+    /// The queries a NanoPi R6S answered through the RK3588 usbplug loader, replayed
+    /// byte for byte.
+    ///
+    /// Every CSW but the storage one carries a big-endian length where the residue
+    /// goes, which reads as hundreds of millions of bytes untransferred. Each reply
+    /// is still the answer, and the probe that classifies a maskrom-flagged board
+    /// reports a loader.
+    #[test]
+    fn the_rk3588_usbplug_replies_are_answers() {
+        let mut chip_version = vec![0x38, 0x38, 0x35, 0x33];
+        chip_version.extend([0xff; 12]);
+        let transport = ScriptedTransport::new(vec![
+            cbw(1, 0, Direction::Out, Opcode::TestUnitReady, 0, 0),
+            csw_passed_with_residue(1, length_big_endian(6)),
+            cbw(2, 16, Direction::In, Opcode::GetChipVer, 0, 0),
+            Step::Reply(chip_version.clone()),
+            csw_passed_with_residue(2, length_big_endian(16)),
+            cbw(3, 8, Direction::In, Opcode::ReadCapability, 0, 0),
+            Step::Reply(vec![0x3f, 0x07, 0, 0, 0, 0, 0, 0]),
+            csw_passed_with_residue(3, length_big_endian(8)),
+            cbw(4, 4, Direction::In, Opcode::GetStorageMedia, 0, 0),
+            Step::Reply(vec![0x02, 0, 0, 0]),
+            csw_passed(4),
+            cbw(5, 5, Direction::In, Opcode::ReadFlashId, 0, 0),
+            Step::Reply(b"EMMC ".to_vec()),
+            csw_passed_with_residue(5, length_big_endian(5)),
+            cbw(6, 11, Direction::In, Opcode::ReadFlashInfo, 0, 0),
+            Step::Reply(vec![
+                0x00, 0x00, 0x9d, 0x03, 0x00, 0x04, 0x04, 0x00, 0x28, 0x00, 0x01,
+            ]),
+            csw_passed_with_residue(6, length_big_endian(11)),
+        ]);
+
+        let mut rockusb = RockusbAgent::new(transport);
         assert!(
-            matches!(&error, Error::Protocol(message) if message.contains("more than it was asked")),
-            "{error:?}"
+            pollster::block_on(rockusb.probe_loader()).expect("the loader answered"),
+            "a loader that answers is a loader, whatever its residue field holds"
         );
+        let mut agent = FlashAgent::Rockusb(rockusb);
+        assert_eq!(
+            pollster::block_on(agent.chip_version()).expect("chip version"),
+            chip_version
+        );
+        let capability = pollster::block_on(agent.capability())
+            .expect("capability")
+            .expect("rockusb answers it");
+        assert!(capability.new_idb() && capability.read_lba());
+        assert_eq!(
+            pollster::block_on(agent.storage_medium()).expect("storage"),
+            Some(rockusb::StorageMedium::Emmc)
+        );
+        let info = pollster::block_on(agent.info()).expect("info");
+        assert_eq!(info.size_bytes, 60_620_800 * 512);
+        assert_eq!(info.chip_id.as_deref(), Some(&b"EMMC "[..]));
+        let FlashAgent::Rockusb(rockusb) = agent else {
+            unreachable!("built as rockusb")
+        };
+        rockusb.transport.assert_drained();
+    }
+
+    /// A probe whose command block meets a dead endpoint finds no loader.
+    ///
+    /// The RK3576 BootROM faults the first bulk transfer. A timeout is the scripted
+    /// stand-in for any transfer that brings no answer back.
+    #[test]
+    fn a_probe_that_brings_nothing_back_finds_no_loader() {
+        let transport = ScriptedTransport::new(vec![Step::Timeout]);
+        let mut agent = RockusbAgent::new(transport);
+        assert!(
+            !pollster::block_on(agent.probe_loader()).expect("silence is an answer here"),
+            "nothing answered, so this is a BootROM's unserved bulk pair"
+        );
+    }
+
+    /// A probe the device answers with a failed status found a loader, and the
+    /// failure is reported rather than called maskrom.
+    #[test]
+    fn a_probe_the_device_fails_is_a_loader_reporting_a_failure() {
+        let transport = ScriptedTransport::new(vec![
+            cbw(1, 0, Direction::Out, Opcode::TestUnitReady, 0, 0),
+            csw_failed(1),
+        ]);
+        let mut agent = RockusbAgent::new(transport);
+        let error = pollster::block_on(agent.probe_loader())
+            .expect_err("a loader answered, and said it failed");
+        assert!(matches!(error, Error::CommandFailed { .. }), "{error:?}");
     }
 
     /// A short data phase is legitimate only for the command whose reply length is

@@ -60,7 +60,7 @@ drive are listed too. Each row shows the board's mode:
 | Mode | What it means |
 |---|---|
 | `loader` | A loader is running and the flash is reachable. |
-| `maskrom` | The bcdUSB flag reports the BootROM. Some loaders present the same even flag, the RK3576 SPL among them, so *Open* probes the board to confirm the mode. A board running its BootROM needs a loader first: select the board and use *Upload loader...*. |
+| `maskrom` | The bcdUSB flag reports the BootROM. Some loaders present the same even flag, the RK3576 SPL and the RK3588 usbplug among them, so *Open* probes the board to confirm the mode. A board running its BootROM needs a loader first: select the board and use *Upload loader...*. |
 | `mass storage` | The board re-enumerated as a USB mass-storage device, and the host operating system owns it as a disk. Open it from [Disks](#disks). |
 | `boot ROM` | An Ingenic device is running its USB boot ROM, which has no flash commands. [Bootstrap it](#bootstrapping-an-ingenic-board) to DFU first. |
 | `DFU` | An Ingenic device is running a DFU-capable U-Boot. Its flash is reachable as named alt-settings. |
@@ -130,11 +130,12 @@ drawn disabled, with the reason.
 ## Uploading a loader
 
 A board in maskrom mode runs the BootROM, which serves no flash commands, so the board needs a
-loader first. Select the board, and the panel under it offers *Upload loader...*. It runs the same upload as the CLI's
-`db`. It asks for the loader file, rkbin's `*_loader.bin` for the SoC, and parses the file as soon
-as you pick it. A file that is not an RKBOOT loader is refused at the dialog, before any device is
-opened. The upload runs as a job, with a progress bar and a *Cancel* that stops it at the next
-chunk.
+loader first. Select the board, and the panel under it offers *Upload loader...*. It runs the
+same upload as the CLI's `db`. It asks for the loader file, rkbin's `*_loader.bin` for the SoC
+or a board vendor's `MiniLoaderAll.bin`. It parses the file as soon as you pick it. A file that
+is not an RKBOOT loader is refused at the dialog, before any device is opened.
+
+The upload runs as a job, with a progress bar and a *Cancel* that stops it at the next chunk.
 
 The loader container names the SoC it was built for. The upload panel shows that claim while the
 upload runs, and the report shows it again. Both give the raw bytes and the SoC pinned for them,
@@ -161,13 +162,13 @@ they are for.
 ### After the upload
 
 On success, the maskrom USB device disconnects, and the board re-enumerates as a new device at a
-new address. On an RK3576, this takes somewhat over three seconds. The window clears the old
-selection and rescans. When the board reappears, select it. It can still be listed as `maskrom`,
-because some loaders present an even bcdUSB flag, and *Open* probes the board to confirm the
-mode.
+new address. On an RK3576, this takes somewhat over three seconds, and on an RK3588S, under one.
+The window clears the old selection and rescans. When the board reappears, select it. It can
+still be listed as `maskrom`, because some loaders present an even bcdUSB flag, and *Open*
+probes the board to confirm the mode.
 
-The container parse, the upload and the re-enumeration are verified on an RK3576 through the
-CLI's `db`. The window's own run of this flow is `[UNVERIFIED]` against hardware.
+The container parse, the upload and the re-enumeration are verified on an RK3576 and an RK3588S
+through the CLI's `db`. The window's own run of this flow is `[UNVERIFIED]` against hardware.
 
 ## Bootstrapping an Ingenic board
 
@@ -513,7 +514,7 @@ color.** U-Boot runs whatever you type, `saveenv` included, with no plan and no 
 Every write to a board is gated on the loader's own answer about which SoC it runs on. You name
 the board's SoC in the **SoC field** on the form. The gate compares the loader's raw answer, the
 plan's `loader says` line, with the reply a real board of that SoC gave, byte for byte. Nothing
-is decoded and nothing is guessed. The RK3576 is the only SoC pinned so far. [The wrong-loader
+is decoded and nothing is guessed. Two SoCs are pinned, the RK3576 and the RK3588. [The wrong-loader
 gate](cli/flash.md#the-wrong-loader-gate) explains why the comparison is exact.
 
 The gate refuses in three cases, each as early as it can:

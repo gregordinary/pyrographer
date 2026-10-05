@@ -10,10 +10,12 @@
 # Guides
 
 - [RAM-booting mainline U-Boot from maskrom](guides/maskrom-uboot.md)
+- [Flashing a disk image from maskrom](guides/maskrom-flash.md)
 
 # Boards
 
 - [Rockchip RK3576](boards/rk3576.md)
+- [Rockchip RK3588](boards/rk3588.md)
 
 # Reference
 

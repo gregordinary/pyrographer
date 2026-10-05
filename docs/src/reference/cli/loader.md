@@ -33,11 +33,13 @@ Chip version: 16 bytes
   ascii       6753............
 ```
 
-This reply is from an RK3576: the SoC's four ASCII digits byte-reversed, then zeros. `chipver`
-sends nothing that changes the device, so you can run it on any board in loader mode.
+This reply is from an RK3576: the SoC's four ASCII digits byte-reversed, then zeros. An RK3588
+answers `38 38 35 33` and twelve bytes of `0xff`. `chipver` sends nothing that changes the
+device, so you can run it on any board in loader mode.
 
 Every write is gated on this reply. The [wrong-loader gate](flash.md#the-wrong-loader-gate)
-compares the whole reply with the exact bytes a real board returned, and decodes nothing. A USB
+compares the whole reply with the exact bytes a real board returned, and decodes nothing. The
+two replies above differ after their digits, which is why the gate compares all 16 bytes. A USB
 product ID names only a family, so the loader is the one authority on which SoC it runs on.
 
 To pin a new SoC, run `chipver` on a board whose SoC you know. The reply and the SoC together
@@ -52,25 +54,32 @@ pyrographer capability
 ```
 
 ```text
-Device:       2207:350e (loader)
-Capability:   09 02 00 00 00 00 00 00
+Device:       2207:350b (maskrom)
+Capability:   3f 07 00 00 00 00 00 00
   yes direct LBA
-   no vendor storage
-   no first 4M access
+  yes vendor storage
+  yes first 4M access
   yes read LBA
-   no read COM log
+  yes read COM log
    no read IDB config
    no read secure mode
-   no new IDB
+  yes new IDB
   yes switch storage
+
+This loader set bits pyrographer has no name for: 10 04 00 00 00 00 00 00
 ```
+
+This reply is from the usbplug loader on an RK3588 board. That loader keeps the even `bcdUSB`
+flag, so the heading reads maskrom although a loader answered, as
+[Listing devices](index.md#listing-devices) describes.
 
 The flags are the loader's own account of itself, and can disagree with what pyrographer
 implements. A loader that does not set `read LBA` does not serve the read path, however well the
 host implements it.
 
-Nothing is gated on these flags, because no board has answered this command yet. pyrographer
-reports a bit it has no name for, rather than ignoring it.
+Writing an ID block is gated on `new IDB`, as
+[Writing the ID block alone](firmware.md#writing-the-id-block-alone) describes. Nothing else is
+gated on these flags. pyrographer reports a bit it has no name for, rather than ignoring it.
 
 ## Reading the storage medium
 

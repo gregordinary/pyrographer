@@ -4048,8 +4048,8 @@ mod tests {
     /// because the person who sees it needs to see what the gate compared.
     #[test]
     fn a_write_refuses_a_loader_that_answers_as_a_different_soc() {
-        // "8853": the answer reference material reports for an RK3588 -- a real
-        // loader, on the wrong board.
+        // "8853": the answer an RK3588's loader gives -- a real loader, on the
+        // wrong board.
         let stranger = [0x38, 0x38, 0x35, 0x33];
         let mut steps = scripted_info(1);
         steps.extend(scripted_chip_version_of(3, &stranger));

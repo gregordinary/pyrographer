@@ -34,6 +34,9 @@ use Rockchip's own parameter block, whose `CMDLINE` line lists the partitions. p
 detects the format by probing for each in turn: `EFI PART` at sector 1, then a `PARM` block
 where one is kept.
 
+pyrographer does not read an MBR. A disk laid out with an MBR alone reads as having no partition
+table, and is aimed by LBA. OpenWrt's image for a Rockchip board is one such disk.
+
 A board with no partition table is in a valid state. `partitions` says so, and succeeds:
 
 ```text
@@ -63,7 +66,8 @@ Partition table: GPT (5 partitions)
 ```
 
 pyrographer reads the backup from the device's last sector. It ignores the damaged primary's
-record of where the backup is.
+record of where the backup is. A primary whose signature is gone entirely reads as no GPT, and
+the backup is not consulted.
 
 If neither copy is intact, `partitions` fails with an error rather than printing an empty list.
 The error tells you the table is damaged, for example half-written, before you write to the

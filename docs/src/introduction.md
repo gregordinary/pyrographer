@@ -2,10 +2,10 @@
 
 > [!WARNING]
 > pyrographer is under active development, and many of its features are untested on real
-> hardware. No write to a board has run on hardware yet. A write that goes wrong can leave a
-> board unable to boot, or destroy the data on a disk. Use pyrographer at your own risk, and
-> only on a device you can afford to lose. In this book, `[UNVERIFIED]` marks a feature that
-> passes its tests against scripted devices and has not yet run on a real one.
+> hardware. Writing has run on one board so far, a raw image flashed to an RK3588S. A write that
+> goes wrong can leave a board unable to boot, or destroy the data on a disk. Use pyrographer at
+> your own risk, and only on a device you can afford to lose. In this book, `[UNVERIFIED]` marks
+> a feature that passes its tests against scripted devices and has not yet run on a real one.
 
 pyrographer is a flashing and recovery toolkit for embedded devices, such as single-board
 computers and IP cameras, written entirely in safe Rust. It comprises a command-line tool, a

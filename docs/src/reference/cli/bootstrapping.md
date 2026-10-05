@@ -9,8 +9,8 @@ BootROM has no USB, and `uartboot` boots it into U-Boot over its serial line ins
 ## Bringing a maskrom board to loader mode
 
 `db` brings a Rockchip board from maskrom mode, where the BootROM runs, to loader mode. It takes
-a Rockchip loader container, rkbin's `*_loader.bin` for the SoC, and uploads it over the maskrom
-download-boot protocol.
+a Rockchip loader container for the SoC, and uploads it over the maskrom download-boot protocol.
+rkbin ships one as `*_loader.bin`, and board vendors ship one as `MiniLoaderAll.bin`.
 
 `list` shows the board in maskrom mode:
 
@@ -51,21 +51,24 @@ This check is weaker than the [wrong-loader gate](flash.md#the-wrong-loader-gate
 Whoever built the file wrote the claim, so the check catches a wrong file chosen by mistake, and
 not a false claim. It is the only check available, because a maskrom board does not answer `chipver`.
 
-When an upload appears to go wrong, two behaviors matter. Both are measured on an RK3576:
+When an upload appears to go wrong, three behaviors matter:
 
-- **A corrupt upload fails silently.** The BootROM acknowledges every transfer of a bad section.
-  It checks the section's trailing CRC after the last chunk, and discards a bad section without
-  reporting an error. The failure surfaces one stage later, as an upload that stalls. A BootROM
-  left with a partial upload also refuses a fresh one. Power-cycle the board and put it back
-  into maskrom before you retry.
-- **The board re-enumerates slowly.** After the final stage, the loader tears down the maskrom
-  USB device. The board comes back as a new device at a new address, somewhat over three
-  seconds later. `db` watches for it for ten seconds. If the board has not reappeared by then,
-  `db` tells you to run `list`, and reports no error.
+- **A corrupt upload fails silently.** Measured on an RK3576, the BootROM acknowledges every
+  transfer of a bad section. It checks the section's trailing CRC after the last chunk, and
+  discards a bad section without reporting an error. The failure surfaces one stage later, as an
+  upload that stalls. A BootROM left with a partial upload also refuses a fresh one. Power-cycle
+  the board and put it back into maskrom before you retry.
+- **The board comes back at a new address.** After the final stage, the loader tears down the
+  maskrom USB device and re-enumerates. An RK3576 takes somewhat over three seconds, and an
+  RK3588S takes under one. `db` watches for the board for ten seconds. If the board has not
+  reappeared by then, `db` tells you to run `list`, and reports no error.
+- **A loader can stop answering.** Seen once on an RK3588S, the loader enumerated and then
+  answered nothing until the board was power-cycled. Every command then reports maskrom.
+  Power-cycle the board into maskrom and upload again.
 
 The board that comes back can still carry an even `bcdUSB` flag, because the RK3576 SPL loader
-never sets it. The verbs resolve that by asking, as [Listing devices](index.md#listing-devices)
-describes.
+and the RK3588 usbplug loader never set it. The verbs resolve that by asking, as
+[Listing devices](index.md#listing-devices) describes.
 
 ### Raw stages
 

@@ -6,10 +6,12 @@
 //! consults. The gate matches **exact pinned bytes**: an entry is the whole reply
 //! a real board gave. A SoC without an entry cannot be named at all.
 //!
-//! Nothing here decodes a reply into meaning. The two replies known, an RK3576's
-//! (measured) and an RK3588's (reported), both read as the SoC's ASCII digits
-//! byte-reversed. The gate does not rely on that shape. One of the two replies is
-//! only reported, and two points do not establish a rule.
+//! Nothing here decodes a reply into meaning. Both pinned replies open with the
+//! SoC's ASCII digits byte-reversed, and they differ after that. The RK3576's SPL
+//! loader sends twelve zeros, and the RK3588's usbplug loader sends twelve `0xff`.
+//! Whether that tail belongs to the SoC or to the loader build is **\[UNVERIFIED\]**.
+//! Either way, a reply with another tail comes from a loader nobody has measured,
+//! and the gate refuses it. That is why an entry is the whole reply.
 //!
 //! Adding a SoC is one entry here. Run `pyrographer chipver` against a board
 //! whose part is known, and pin what it answered.
@@ -32,10 +34,10 @@ pub struct Soc {
     /// The four bytes an RKBOOT container for this SoC carries in its chip
     /// field, or `None` where no container has been measured.
     ///
-    /// Pinned separately from `reply`, and never derived from it. On the one SoC
-    /// where both are measured, they agree. An RK3576 container says `"6753"`, and
-    /// an RK3576 loader answers `"6753"` and twelve zeros. That agreement is a
-    /// measurement, not a rule for computing one from the other.
+    /// Pinned separately from `reply`, and never derived from it. On both pinned
+    /// SoCs, they agree. An RK3576 container says `"6753"`, and an RK3576 loader
+    /// answers `"6753"` and twelve zeros. That agreement is a measurement, not a
+    /// rule for computing one from the other.
     ///
     /// A SoC pinned by a board but by no container is `None` here. Its container
     /// cannot be judged before an upload, which is a different answer from judging
@@ -58,6 +60,20 @@ const PINNED: &[Soc] = &[
         // from an `.ini` whose `[CHIP_NAME] NAME=RK3576` is what puts the bytes
         // there. All four carry `"6753"`.
         container_chip: Some(b"6753"),
+    },
+    // NanoPi R6S, an RK3588S, 2026-10-05, through the usbplug loader in the
+    // `MiniLoaderAll.bin` on FriendlyELEC's RK3588 eflasher card (2025-12-22):
+    // "8853" -- the SoC's ASCII digits byte-reversed -- and twelve 0xff. The
+    // RK3588S is the RK3588 in a smaller package, and answers as one.
+    Soc {
+        name: "rk3588",
+        reply: &[
+            0x38, 0x38, 0x35, 0x33, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff,
+        ],
+        // Measured at offset 21 of one container: the same `MiniLoaderAll.bin`,
+        // whose loader gave the reply above.
+        container_chip: Some(b"8853"),
     },
 ];
 
@@ -198,33 +214,39 @@ mod tests {
         );
         assert_eq!(
             by_container_chip(b"8853").map(|soc| soc.name()),
+            Some("rk3588")
+        );
+        assert_eq!(
+            by_container_chip(b"9933").map(|soc| soc.name()),
             None,
-            "an RK3588 container is not pinned, so nothing claims those bytes"
+            "no entry pins these bytes, so nothing claims them"
         );
         assert_eq!(by_container_chip(&[]).map(|soc| soc.name()), None);
     }
 
     /// The container value is pinned in its own right, not computed from the
-    /// chipver reply. The two agree on the one SoC where both are measured. This
+    /// chipver reply. The two agree on both SoCs where both are measured. This
     /// test asserts that agreement as an observation, not a derivation.
     #[test]
     fn the_container_value_is_pinned_separately_from_the_chipver_reply() {
-        let rk3576 = Soc::parse("rk3576").expect("pinned");
-        let container = rk3576.container_chip().expect("measured from four files");
-        assert_eq!(container, b"6753");
-        assert_eq!(
-            container,
-            &rk3576.pinned_reply()[..4],
-            "on this SoC the two measurements agree; that is an observation, and \
-             nothing computes one from the other"
-        );
+        for (name, chip) in [("rk3576", b"6753"), ("rk3588", b"8853")] {
+            let soc = Soc::parse(name).expect("pinned");
+            let container = soc.container_chip().expect("measured from a file");
+            assert_eq!(container, chip);
+            assert_eq!(
+                container,
+                &soc.pinned_reply()[..4],
+                "on {name} the two measurements agree; that is an observation, and \
+                 nothing computes one from the other"
+            );
+        }
     }
 
     /// A SoC nobody has measured cannot be named. The refusal lists the pinned
     /// SoCs and says how to pin a new one.
     #[test]
     fn an_unpinned_soc_is_refused_with_the_pinned_list_named() {
-        for stranger in ["rk3588", "rk3399", "banana"] {
+        for stranger in ["rk3399", "rk3566", "banana"] {
             let error = Soc::parse(stranger).expect_err("no board has pinned this");
             let Error::InvalidRequest(message) = error else {
                 panic!("an unpinned SoC is a caller problem, not a device one");
@@ -249,5 +271,22 @@ mod tests {
             "another SoC's digits"
         );
         assert!(!soc.matches(&[]), "an empty reply");
+    }
+
+    /// The RK3588 reply is pinned with the tail its loader sent. The same digits
+    /// with the RK3576's zero tail come from a loader nobody has measured.
+    #[test]
+    fn the_rk3588_reply_is_pinned_whole_with_its_tail() {
+        let soc = Soc::parse("RK3588").expect("pinned");
+        assert_eq!(soc.name(), "rk3588");
+
+        let mut measured = vec![0x38, 0x38, 0x35, 0x33];
+        measured.extend([0xff; 12]);
+        assert!(soc.matches(&measured));
+
+        let mut zero_tail = vec![0x38, 0x38, 0x35, 0x33];
+        zero_tail.extend([0x00; 12]);
+        assert!(!soc.matches(&zero_tail), "another tail");
+        assert!(!soc.matches(&[0x38, 0x38, 0x35, 0x33]), "no tail");
     }
 }
